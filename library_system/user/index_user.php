@@ -145,6 +145,16 @@ $stmt = $pdo->prepare("
 ");
 $stmt->execute([$user_id]);
 $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Get system settings for borrowing limits
+$stmt = $pdo->prepare("SELECT setting_key, setting_value FROM system_settings WHERE setting_key IN ('max_borrow_books', 'max_borrow_days')");
+$stmt->execute();
+$settings = [];
+while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+    $settings[$row['setting_key']] = $row['setting_value'];
+}
+$max_borrow_books = (int)($settings['max_borrow_books'] ?? 5);
+$max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
 ?>
 
 <!DOCTYPE html>
@@ -432,6 +442,7 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             overflow: hidden;
             box-shadow: 0 5px 15px rgba(0,0,0,0.1);
             transition: all 0.3s ease;
+            position: relative;
         }
 
         .book-card:hover {
@@ -447,6 +458,18 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             justify-content: center;
             color: white;
             font-size: 3rem;
+            position: relative;
+        }
+
+        .book-availability {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            padding: 0.3rem 0.8rem;
+            border-radius: 15px;
+            font-size: 0.8rem;
         }
 
         .book-info {
@@ -497,10 +520,21 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             cursor: pointer;
             font-size: 0.9rem;
             transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
         }
 
-        .btn-borrow:hover {
+        .btn-borrow:hover:not(:disabled) {
             transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .btn-borrow:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none !important;
         }
 
         .btn-details {
@@ -511,6 +545,9 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             border-radius: 8px;
             cursor: pointer;
             transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
 
         .btn-details:hover {
@@ -627,6 +664,76 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             border: 2px solid #667eea;
         }
 
+        /* Notification */
+        .notification {
+            position: fixed;
+            top: 100px;
+            right: 20px;
+            padding: 1rem 1.5rem;
+            border-radius: 10px;
+            color: white;
+            font-weight: 500;
+            z-index: 9999;
+            transform: translateX(100%);
+            transition: transform 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            max-width: 400px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .notification.show {
+            transform: translateX(0);
+        }
+
+        .notification.success {
+            background: #4caf50;
+        }
+
+        .notification.error {
+            background: #f44336;
+        }
+
+        .notification.warning {
+            background: #ff9800;
+        }
+
+        /* Loading overlay */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.7);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 10000;
+            color: white;
+            flex-direction: column;
+        }
+
+        .loading-overlay.show {
+            display: flex;
+        }
+
+        .spinner {
+            border: 4px solid rgba(255,255,255,0.3);
+            border-top: 4px solid white;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 1rem;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
         /* Mobile Responsive */
         @media (max-width: 768px) {
             .nav-links {
@@ -675,31 +782,15 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             font-size: 1.2rem;
             margin-bottom: 0.5rem;
         }
-
-        /* Loading Animation */
-        .loading {
-            display: none;
-            text-align: center;
-            padding: 2rem;
-        }
-
-        .spinner {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #667eea;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 0 auto;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
     </style>
 </head>
 <body>
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="spinner"></div>
+        <p>กำลังดำเนินการ...</p>
+    </div>
+
     <!-- Header -->
     <header class="header">
         <nav class="nav-container">
@@ -709,7 +800,7 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             </div>
             <ul class="nav-links">
                 <li><a href="dashboard.php">แดชบอร์ด</a></li>
-                <li><a href="index.php" class="active">หน้าแรก</a></li>
+                <li><a href="#" class="active">หน้าแรก</a></li>
                 <li><a href="profile.php">โปรไฟล์</a></li>
                 <li><a href="history.php">ประวัติการยืม</a></li>
                 <li><a href="search.php">ค้นหาหนังสือ</a></li>
@@ -732,7 +823,7 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             <div class="user-stats">
                 <div class="user-stat-card">
                     <i class="fas fa-book-reader"></i>
-                    <div class="user-stat-number"><?php echo $user_borrowed_count; ?></div>
+                    <div class="user-stat-number"><?php echo $user_borrowed_count; ?>/<?php echo $max_borrow_books; ?></div>
                     <div class="user-stat-label">กำลังยืมอยู่</div>
                 </div>
                 <div class="user-stat-card">
@@ -746,9 +837,9 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     <div class="user-stat-label">กิจกรรม 30 วัน</div>
                 </div>
                 <div class="user-stat-card">
-                    <i class="fas fa-layer-group"></i>
-                    <div class="user-stat-number"><?php echo $stats['total_categories']; ?></div>
-                    <div class="user-stat-label">หมวดหมู่หนังสือ</div>
+                    <i class="fas fa-calendar-day"></i>
+                    <div class="user-stat-number"><?php echo $max_borrow_days; ?></div>
+                    <div class="user-stat-label">วันที่อนุญาตให้ยืม</div>
                 </div>
             </div>
         </div>
@@ -836,13 +927,21 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         <?php 
                         $display_books = !empty($search) || $category_id > 0 ? $books : $recommended_books;
                         foreach ($display_books as $book): 
+                            // Check if user already borrowed this book
+                            $stmt = $pdo->prepare("SELECT COUNT(*) FROM borrowing WHERE user_id = ? AND book_id = ? AND status IN ('borrowed', 'overdue')");
+                            $stmt->execute([$user_id, $book['book_id']]);
+                            $already_borrowed = $stmt->fetchColumn() > 0;
                         ?>
-                            <div class="book-card">
+                            <div class="book-card" data-book-id="<?php echo $book['book_id']; ?>">
                                 <div class="book-image">
+                                    <div class="book-availability">
+                                        <?php echo $book['available_copies']; ?>/<?php echo $book['total_copies']; ?> เล่ม
+                                    </div>
                                     <?php if (!empty($book['cover_image'])): ?>
                                         <img src="<?php echo htmlspecialchars($book['cover_image']); ?>" 
                                              alt="<?php echo htmlspecialchars($book['title']); ?>"
-                                             style="width: 100%; height: 100%; object-fit: cover;">
+                                             style="width: 100%; height: 100%; object-fit: cover;"
+                                             onerror="this.style.display='none'; this.parentElement.innerHTML='<i class=\'fas fa-book\'></i><div class=\'book-availability\'><?php echo $book['available_copies']; ?>/<?php echo $book['total_copies']; ?> เล่ม</div>';">
                                     <?php else: ?>
                                         <i class="fas fa-book"></i>
                                     <?php endif; ?>
@@ -863,13 +962,29 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
                                     </div>
                                     
                                     <div class="book-actions">
-                                        <button class="btn-borrow" 
-                                                onclick="borrowBook(<?php echo $book['book_id']; ?>)"
-                                                <?php echo $book['available_copies'] <= 0 ? 'disabled' : ''; ?>>
-                                            <i class="fas fa-hand-holding"></i>
-                                            <?php echo $book['available_copies'] > 0 ? 'ยืมหนังสือ' : 'ไม่ว่าง'; ?>
-                                        </button>
-                                        <button class="btn-details" onclick="showBookDetails(<?php echo $book['book_id']; ?>)">
+                                        <?php if ($already_borrowed): ?>
+                                            <button class="btn-borrow" disabled style="background: #28a745;">
+                                                <i class="fas fa-check"></i>
+                                                ยืมแล้ว
+                                            </button>
+                                        <?php elseif ($user_borrowed_count >= $max_borrow_books): ?>
+                                            <button class="btn-borrow" disabled title="ยืมครบจำนวนสูงสุดแล้ว">
+                                                <i class="fas fa-ban"></i>
+                                                ยืมครบแล้ว
+                                            </button>
+                                        <?php elseif ($book['available_copies'] <= 0): ?>
+                                            <button class="btn-borrow" disabled>
+                                                <i class="fas fa-times"></i>
+                                                ไม่ว่าง
+                                            </button>
+                                        <?php else: ?>
+                                            <button class="btn-borrow" onclick="borrowBook(<?php echo $book['book_id']; ?>, '<?php echo addslashes($book['title']); ?>')">
+                                                <i class="fas fa-hand-holding"></i>
+                                                ยืมหนังสือ
+                                            </button>
+                                        <?php endif; ?>
+                                        
+                                        <button class="btn-details" onclick="showBookDetails(<?php echo $book['book_id']; ?>)" title="ดูรายละเอียด">
                                             <i class="fas fa-info-circle"></i>
                                         </button>
                                     </div>
@@ -886,7 +1001,18 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
                             if (!empty($search)) $query_params['search'] = $search;
                             if ($category_id > 0) $query_params['category'] = $category_id;
                             
-                            for ($i = 1; $i <= $total_pages; $i++):
+                            // Previous page
+                            if ($page > 1) {
+                                $query_params['page'] = $page - 1;
+                                $url = '?' . http_build_query($query_params);
+                                echo '<a href="' . $url . '"><i class="fas fa-chevron-left"></i></a>';
+                            }
+                            
+                            // Page numbers
+                            $start_page = max(1, $page - 2);
+                            $end_page = min($total_pages, $page + 2);
+                            
+                            for ($i = $start_page; $i <= $end_page; $i++):
                                 $query_params['page'] = $i;
                                 $url = '?' . http_build_query($query_params);
                             ?>
@@ -896,6 +1022,15 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
                                     <a href="<?php echo $url; ?>"><?php echo $i; ?></a>
                                 <?php endif; ?>
                             <?php endfor; ?>
+                            
+                            <?php
+                            // Next page
+                            if ($page < $total_pages) {
+                                $query_params['page'] = $page + 1;
+                                $url = '?' . http_build_query($query_params);
+                                echo '<a href="' . $url . '"><i class="fas fa-chevron-right"></i></a>';
+                            }
+                            ?>
                         </div>
                     <?php endif; ?>
                 <?php endif; ?>
@@ -943,52 +1078,187 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
                             </div>
                         </div>
                     <?php endforeach; ?>
+                    
+                    <div style="text-align: center; margin-top: 1rem;">
+                        <a href="history.php" style="color: #667eea; text-decoration: none; font-size: 0.9rem;">
+                            <i class="fas fa-arrow-right"></i> ดูกิจกรรมทั้งหมด
+                        </a>
+                    </div>
                 <?php endif; ?>
             </div>
         </div>
     </div>
 
     <script>
-        function borrowBook(bookId) {
-            if (confirm('คุณต้องการยืมหนังสือเล่มนี้หรือไม่?')) {
-                // Show loading
-                const loadingDiv = document.createElement('div');
-                loadingDiv.className = 'loading';
-                loadingDiv.innerHTML = '<div class="spinner"></div><p>กำลังดำเนินการ...</p>';
-                loadingDiv.style.display = 'block';
-                document.body.appendChild(loadingDiv);
+        // Global variables
+        let isProcessing = false;
 
-                // Send AJAX request to borrow book
-                fetch('../borrow_book.php', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        book_id: bookId
-                    })
+        // Show notification function
+        function showNotification(message, type = 'success') {
+            // Remove existing notifications
+            const existingNotifications = document.querySelectorAll('.notification');
+            existingNotifications.forEach(notification => notification.remove());
+
+            // Create new notification
+            const notification = document.createElement('div');
+            notification.className = `notification ${type}`;
+            
+            const icon = type === 'success' ? 'check-circle' : 
+                        type === 'error' ? 'exclamation-triangle' : 
+                        type === 'warning' ? 'exclamation-circle' : 'info-circle';
+            
+            notification.innerHTML = `
+                <i class="fas fa-${icon}"></i>
+                <span>${message}</span>
+            `;
+            
+            document.body.appendChild(notification);
+            
+            // Show notification
+            setTimeout(() => {
+                notification.classList.add('show');
+            }, 100);
+            
+            // Auto hide after 5 seconds
+            setTimeout(() => {
+                hideNotification(notification);
+            }, 5000);
+            
+            return notification;
+        }
+
+        // Hide notification function
+        function hideNotification(notification) {
+            notification.classList.remove('show');
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+            }, 300);
+        }
+
+        // Show loading overlay
+        function showLoading(message = 'กำลังดำเนินการ...') {
+            const loadingOverlay = document.getElementById('loadingOverlay');
+            const loadingText = loadingOverlay.querySelector('p');
+            loadingText.textContent = message;
+            loadingOverlay.classList.add('show');
+        }
+
+        // Hide loading overlay
+        function hideLoading() {
+            const loadingOverlay = document.getElementById('loadingOverlay');
+            loadingOverlay.classList.remove('show');
+        }
+
+        // Borrow book function - ปรับปรุงแล้ว
+        function borrowBook(bookId, bookTitle) {
+            if (isProcessing) {
+                showNotification('กรุณารอการดำเนินการเสร็จสิ้น', 'warning');
+                return;
+            }
+
+            // Show confirmation dialog
+            if (!confirm(`คุณต้องการยืมหนังสือ "${bookTitle}" หรือไม่?\n\nระยะเวลายืม: <?php echo $max_borrow_days; ?> วัน\nกำหนดคืน: ${getEstimatedDueDate()}`)) {
+                return;
+            }
+
+            isProcessing = true;
+            showLoading('กำลังดำเนินการยืมหนังสือ...');
+
+            // ปรับ path ให้ถูกต้อง - ใช้ borrow_book.php ที่อยู่ในโฟลเดอร์เดียวกัน
+            fetch('borrow_book.php', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: JSON.stringify({
+                    book_id: bookId
                 })
-                .then(response => response.json())
-                .then(data => {
-                    document.body.removeChild(loadingDiv);
-                    if (data.success) {
-                        alert('ยืมหนังสือสำเร็จ! กรุณาคืนภายในกำหนด');
-                        location.reload(); // Refresh to update availability
-                    } else {
-                        alert('เกิดข้อผิดพลาด: ' + data.message);
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                hideLoading();
+                isProcessing = false;
+                
+                if (data.success) {
+                    showNotification(`ยืมหนังสือ "${bookTitle}" สำเร็จ!\nกรุณาคืนภายในวันที่ ${data.data.due_date}`, 'success');
+                    
+                    // Update UI
+                    updateBookCardAfterBorrow(bookId);
+                    updateUserStats();
+                    
+                    // Auto refresh after 3 seconds
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 3000);
+                } else {
+                    showNotification(`ไม่สามารถยืมหนังสือได้: ${data.message}`, 'error');
+                }
+            })
+            .catch(error => {
+                hideLoading();
+                isProcessing = false;
+                console.error('Borrow book error:', error);
+                showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่อีกครั้ง', 'error');
+            });
+        }
+
+        // Update book card after successful borrow
+        function updateBookCardAfterBorrow(bookId) {
+            const bookCard = document.querySelector(`[data-book-id="${bookId}"]`);
+            if (bookCard) {
+                const borrowBtn = bookCard.querySelector('.btn-borrow');
+                if (borrowBtn) {
+                    borrowBtn.disabled = true;
+                    borrowBtn.style.background = '#28a745';
+                    borrowBtn.innerHTML = '<i class="fas fa-check"></i> ยืมแล้ว';
+                }
+                
+                // Update availability counter
+                const availability = bookCard.querySelector('.book-availability');
+                if (availability) {
+                    const text = availability.textContent;
+                    const matches = text.match(/(\d+)\/(\d+)/);
+                    if (matches) {
+                        const available = parseInt(matches[1]) - 1;
+                        const total = matches[2];
+                        availability.textContent = `${available}/${total} เล่ม`;
                     }
-                })
-                .catch(error => {
-                    document.body.removeChild(loadingDiv);
-                    alert('เกิดข้อผิดพลาดในการเชื่อมต่อ');
-                    console.error('Error:', error);
-                });
+                }
             }
         }
 
+        // Update user stats
+        function updateUserStats() {
+            const borrowedStat = document.querySelector('.user-stat-card .user-stat-number');
+            if (borrowedStat) {
+                const text = borrowedStat.textContent;
+                const matches = text.match(/(\d+)\/(\d+)/);
+                if (matches) {
+                    const current = parseInt(matches[1]) + 1;
+                    const max = matches[2];
+                    borrowedStat.textContent = `${current}/${max}`;
+                }
+            }
+        }
+
+        // Show book details
         function showBookDetails(bookId) {
-            // Redirect to book details page
-            window.location.href = '../book_details.php?id=' + bookId;
+            window.location.href = `../book_details.php?id=${bookId}`;
+        }
+
+        // Get estimated due date
+        function getEstimatedDueDate() {
+            const now = new Date();
+            now.setDate(now.getDate() + <?php echo $max_borrow_days; ?>);
+            return now.toLocaleDateString('th-TH');
         }
 
         // Search form enhancement
@@ -997,49 +1267,64 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             if (searchInput.value.trim() === '') {
                 e.preventDefault();
                 searchInput.focus();
+                showNotification('กรุณาใส่คำค้นหา', 'warning');
                 return;
             }
             
             // Show loading state
             const searchBtn = document.querySelector('.search-btn');
-            const originalText = searchBtn.innerHTML;
+            const originalHTML = searchBtn.innerHTML;
             searchBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
             searchBtn.disabled = true;
             
-            // Re-enable button after a short delay if form doesn't submit
-            setTimeout(() => {
-                searchBtn.innerHTML = originalText;
-                searchBtn.disabled = false;
-            }, 3000);
+            // Save search query
+            sessionStorage.setItem('lastSearch', searchInput.value);
         });
 
         // Add scroll effect to header
+        let lastScrollY = window.scrollY;
         window.addEventListener('scroll', function() {
             const header = document.querySelector('.header');
-            if (window.scrollY > 100) {
+            const currentScrollY = window.scrollY;
+            
+            if (currentScrollY > 100) {
                 header.style.background = 'rgba(102, 126, 234, 0.95)';
                 header.style.backdropFilter = 'blur(10px)';
             } else {
                 header.style.background = 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)';
                 header.style.backdropFilter = 'none';
             }
+            
+            // Hide/show header on scroll
+            if (currentScrollY > lastScrollY && currentScrollY > 200) {
+                header.style.transform = 'translateY(-100%)';
+            } else {
+                header.style.transform = 'translateY(0)';
+            }
+            lastScrollY = currentScrollY;
         });
 
-        // Book card hover effects
+        // Enhanced book card interactions
         document.querySelectorAll('.book-card').forEach(card => {
             card.addEventListener('mouseenter', function() {
-                this.style.transform = 'translateY(-5px) scale(1.02)';
+                if (!this.classList.contains('borrowing')) {
+                    this.style.transform = 'translateY(-8px) scale(1.02)';
+                    this.style.boxShadow = '0 20px 40px rgba(0,0,0,0.15)';
+                }
             });
             
             card.addEventListener('mouseleave', function() {
-                this.style.transform = 'translateY(0) scale(1)';
+                if (!this.classList.contains('borrowing')) {
+                    this.style.transform = 'translateY(0) scale(1)';
+                    this.style.boxShadow = '0 5px 15px rgba(0,0,0,0.1)';
+                }
             });
         });
 
         // Quick action hover effects
         document.querySelectorAll('.quick-action').forEach(action => {
             action.addEventListener('mouseenter', function() {
-                this.style.transform = 'translateY(-3px) scale(1.02)';
+                this.style.transform = 'translateY(-5px) scale(1.02)';
             });
             
             action.addEventListener('mouseleave', function() {
@@ -1053,6 +1338,7 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
             if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
                 e.preventDefault();
                 document.querySelector('.search-input').focus();
+                showNotification('ใช้ Ctrl+K เพื่อค้นหาอย่างรวดเร็ว', 'info');
             }
             
             // Alt + D for dashboard
@@ -1072,195 +1358,172 @@ $recent_activity = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 e.preventDefault();
                 window.location.href = 'history.php';
             }
+            
+            // Escape to clear search
+            if (e.key === 'Escape') {
+                const searchInput = document.querySelector('.search-input');
+                if (document.activeElement === searchInput) {
+                    searchInput.value = '';
+                    searchInput.blur();
+                }
+            }
         });
 
-        // Smooth scrolling for navigation links
-        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-            anchor.addEventListener('click', function (e) {
-                e.preventDefault();
-                const target = document.querySelector(this.getAttribute('href'));
-                if (target) {
-                    target.scrollIntoView({
-                        behavior: 'smooth',
-                        block: 'start'
-                    });
+        // Initialize page
+        document.addEventListener('DOMContentLoaded', function() {
+            // Show welcome message based on time
+            const hour = new Date().getHours();
+            const greeting = hour < 12 ? 'สวัสดีตอนเช้า' : hour < 17 ? 'สวัสดีตอนบ่าย' : 'สวัสดีตอนเย็น';
+            
+            // Restore last search if available
+            const lastSearch = sessionStorage.getItem('lastSearch');
+            if (lastSearch && !document.querySelector('.search-input').value) {
+                document.querySelector('.search-input').placeholder += ` (ล่าสุด: "${lastSearch}")`;
+            }
+            
+            // Add tooltips to disabled buttons
+            document.querySelectorAll('.btn-borrow:disabled').forEach(btn => {
+                if (!btn.hasAttribute('title')) {
+                    const text = btn.textContent.trim();
+                    if (text.includes('ไม่ว่าง')) {
+                        btn.title = 'หนังสือเล่มนี้ถูกยืมหมดแล้ว';
+                    } else if (text.includes('ยืมครบ')) {
+                        btn.title = `คุณยืมหนังสือครบ ${<?php echo $max_borrow_books; ?>} เล่มแล้ว`;
+                    }
                 }
             });
+            
+            // Performance monitoring
+            if (performance.mark) {
+                performance.mark('page-interactive');
+                
+                // Log load performance
+                window.addEventListener('load', function() {
+                    const navigation = performance.getEntriesByType('navigation')[0];
+                    const loadTime = navigation.loadEventEnd - navigation.fetchStart;
+                    console.log(`Page loaded in ${loadTime.toFixed(2)}ms`);
+                });
+            }
+            
+            // Add real-time clock
+            updateClock();
+            setInterval(updateClock, 1000);
         });
 
-        // Animation on scroll
-        const observerOptions = {
-            threshold: 0.1,
-            rootMargin: '0px 0px -50px 0px'
-        };
-
-        const observer = new IntersectionObserver((entries) => {
-            entries.forEach(entry => {
-                if (entry.isIntersecting) {
-                    entry.target.style.opacity = '0';
-                    entry.target.style.transform = 'translateY(20px)';
-                    entry.target.style.transition = 'all 0.6s ease';
-                    
-                    setTimeout(() => {
-                        entry.target.style.opacity = '1';
-                        entry.target.style.transform = 'translateY(0)';
-                    }, 100);
-                    
-                    observer.unobserve(entry.target);
-                }
-            });
-        }, observerOptions);
-
-        // Observe elements for animation
-        document.querySelectorAll('.book-card, .quick-action, .section').forEach(element => {
-            observer.observe(element);
-        });
-
-        // Add loading states to buttons
-        document.querySelectorAll('.btn-borrow').forEach(btn => {
-            btn.addEventListener('click', function() {
-                if (!this.disabled) {
-                    const originalText = this.innerHTML;
-                    this.innerHTML = '<i class="fas fa-spinner fa-spin"></i> กำลังดำเนินการ...';
-                    this.disabled = true;
-                    
-                    // Reset if no AJAX call is made
-                    setTimeout(() => {
-                        this.innerHTML = originalText;
-                        this.disabled = false;
-                    }, 3000);
-                }
-            });
-        });
-
-        // Real-time clock in welcome banner
-        function updateWelcomeTime() {
+        // Real-time clock function
+        function updateClock() {
             const now = new Date();
             const timeString = now.toLocaleTimeString('th-TH');
-            const greeting = getTimeGreeting();
+            const dateString = now.toLocaleDateString('th-TH', {
+                weekday: 'long',
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric'
+            });
             
-            // Update greeting if element exists
-            const greetingElement = document.querySelector('.time-greeting');
-            if (greetingElement) {
-                greetingElement.textContent = `${greeting} - ${timeString}`;
-            }
+            // Update page title with time
+            document.title = `${timeString} - ห้องสมุดดิจิทัล`;
         }
 
-        function getTimeGreeting() {
-            const hour = new Date().getHours();
-            if (hour < 12) return 'สวัสดีตอนเช้า';
-            if (hour < 17) return 'สวัสดีตอนบ่าย';
-            return 'สวัสดีตอนเย็น';
-        }
-
-        // Update clock every second
-        setInterval(updateWelcomeTime, 1000);
-        updateWelcomeTime(); // Initial call
-
-        // Add welcome message based on time
-        document.addEventListener('DOMContentLoaded', function() {
-            const welcomeText = document.querySelector('.welcome-banner p');
-            if (welcomeText) {
-                const greeting = getTimeGreeting();
-                welcomeText.innerHTML = `${greeting}! ค้นหาและยืมหนังสือออนไลน์ วิทยาลัยเทคนิคหาดใหญ่`;
-            }
-        });
-
-        // Console branding
-        console.log('%cห้องสมุดดิจิทัล - วิทยาลัยเทคนิคหาดใหญ่', 'color: #667eea; font-size: 20px; font-weight: bold;');
-        console.log('%cUser Home Page - Developed with ❤️', 'color: #764ba2; font-size: 14px;');
-        console.log('พัฒนาโดย นายปิยพัชร์ ทองวงศ์');
-
-        // Performance monitoring
-        if (performance.mark) {
-            performance.mark('home-load-start');
-            
-            window.addEventListener('load', function() {
-                performance.mark('home-load-end');
-                performance.measure('home-load-time', 'home-load-start', 'home-load-end');
-                
-                const loadTime = performance.getEntriesByName('home-load-time')[0];
-                console.log(`Home page loaded in ${loadTime.duration.toFixed(2)}ms`);
-            });
-        }
-
-        // Add search history (localStorage fallback for demo)
-        function saveSearchHistory(query) {
-            if (query.trim()) {
-                let history = JSON.parse(sessionStorage.getItem('searchHistory') || '[]');
-                history = history.filter(item => item !== query);
-                history.unshift(query);
-                history = history.slice(0, 5); // Keep only last 5 searches
-                sessionStorage.setItem('searchHistory', JSON.stringify(history));
-            }
-        }
-
-        // Enhanced search with history
-        const searchInput = document.querySelector('.search-input');
-        if (searchInput) {
-            searchInput.addEventListener('focus', function() {
-                const history = JSON.parse(sessionStorage.getItem('searchHistory') || '[]');
-                if (history.length > 0) {
-                    // Could show search history dropdown here
-                    console.log('Search history:', history);
-                }
-            });
-
-            // Save search when form is submitted
-            document.querySelector('.search-form').addEventListener('submit', function() {
-                saveSearchHistory(searchInput.value);
-            });
-        }
-
-        // Mobile menu toggle
-        function toggleMobileMenu() {
-            const navLinks = document.querySelector('.nav-links');
-            navLinks.style.display = navLinks.style.display === 'flex' ? 'none' : 'flex';
-        }
-
-        // Add mobile menu button if needed
-        if (window.innerWidth <= 768) {
-            const navContainer = document.querySelector('.nav-container');
-            const mobileMenuBtn = document.createElement('button');
-            mobileMenuBtn.innerHTML = '<i class="fas fa-bars"></i>';
-            mobileMenuBtn.className = 'mobile-menu-btn';
-            mobileMenuBtn.style.cssText = `
-                background: none;
-                border: none;
-                color: white;
-                font-size: 1.5rem;
-                cursor: pointer;
-                display: block;
-            `;
-            mobileMenuBtn.addEventListener('click', toggleMobileMenu);
-            navContainer.appendChild(mobileMenuBtn);
-        }
-
-        // Add pull-to-refresh functionality (mobile)
+        // Add pull-to-refresh for mobile
         let startY = 0;
-        let isPulling = false;
+        let pullDistance = 0;
+        const threshold = 100;
 
         document.addEventListener('touchstart', function(e) {
             if (window.scrollY === 0) {
                 startY = e.touches[0].pageY;
-                isPulling = true;
             }
         });
 
         document.addEventListener('touchmove', function(e) {
-            if (isPulling && window.scrollY === 0) {
-                const currentY = e.touches[0].pageY;
-                const pullDistance = currentY - startY;
-                
-                if (pullDistance > 100) {
-                    // Could trigger refresh here
-                    console.log('Pull to refresh triggered');
+            if (window.scrollY === 0 && startY > 0) {
+                pullDistance = e.touches[0].pageY - startY;
+                if (pullDistance > 0) {
+                    e.preventDefault();
+                    const opacity = Math.min(pullDistance / threshold, 1);
+                    document.body.style.transform = `translateY(${Math.min(pullDistance * 0.5, 50)}px)`;
+                    document.body.style.opacity = 1 - (opacity * 0.3);
                 }
             }
         });
 
         document.addEventListener('touchend', function() {
-            isPulling = false;
+            if (pullDistance > threshold) {
+                showNotification('กำลังรีเฟรชหน้า...', 'info');
+                setTimeout(() => {
+                    window.location.reload();
+                }, 500);
+            }
+            
+            // Reset
+            document.body.style.transform = '';
+            document.body.style.opacity = '';
+            startY = 0;
+            pullDistance = 0;
+        });
+
+        // Console branding
+        console.log('%cห้องสมุดดิจิทัล - วิทยาลัยเทคนิคหาดใหญ่', 'color: #667eea; font-size: 20px; font-weight: bold;');
+        console.log('%cUser Dashboard - Enhanced with ❤️', 'color: #764ba2; font-size: 14px;');
+        console.log('พัฒนาโดย นายปิยพัชร์ ทองวงศ์');
+        console.log('Keyboard shortcuts: Ctrl+K (search), Alt+D (dashboard), Alt+P (profile), Alt+H (history)');
+
+        // Add contextual help
+        function showHelp() {
+            const helpContent = `
+                🔍 เคล็ดลับการใช้งาน:
+                • กด Ctrl+K เพื่อค้นหาอย่างรวดเร็ว
+                • กด Alt+D เพื่อไปยังแดชบอร์ด
+                • ดับเบิลคลิกที่หนังสือเพื่อดูรายละเอียด
+                • ลากลงเพื่อรีเฟรช (มือถือ)
+                
+                📚 ข้อมูลการยืม:
+                • ยืมได้สูงสุด ${<?php echo $max_borrow_books; ?>} เล่ม
+                • ระยะเวลา ${<?php echo $max_borrow_days; ?>} วัน
+                • ไม่มีค่าปรับ (ยกเว้นให้)
+            `;
+            
+            alert(helpContent);
+        }
+
+        // Add help button (floating)
+        const helpButton = document.createElement('button');
+        helpButton.innerHTML = '<i class="fas fa-question-circle"></i>';
+        helpButton.style.cssText = `
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            font-size: 1.2rem;
+            cursor: pointer;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            transition: all 0.3s ease;
+            z-index: 1000;
+        `;
+        helpButton.addEventListener('click', showHelp);
+        helpButton.addEventListener('mouseenter', function() {
+            this.style.transform = 'scale(1.1)';
+        });
+        helpButton.addEventListener('mouseleave', function() {
+            this.style.transform = 'scale(1)';
+        });
+        document.body.appendChild(helpButton);
+
+        // Error handling for images
+        document.querySelectorAll('img').forEach(img => {
+            img.addEventListener('error', function() {
+                this.style.display = 'none';
+                const bookIcon = document.createElement('i');
+                bookIcon.className = 'fas fa-book';
+                bookIcon.style.fontSize = '3rem';
+                this.parentElement.appendChild(bookIcon);
+            });
         });
     </script>
 </body>
