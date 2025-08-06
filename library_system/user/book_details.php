@@ -57,24 +57,48 @@ $user = $stmt->fetch(PDO::FETCH_ASSOC);
 // Check if user already borrowed this book
 $stmt = $pdo->prepare("
     SELECT * FROM borrowing 
-    WHERE user_id = ? AND book_id = ? AND status IN ('borrowed', 'overdue')
+    WHERE user_id = ? AND book_id = ? AND status IN ('borrowed', 'overdue', 'pending_return')
 ");
 $stmt->execute([$user_id, $book_id]);
 $current_borrow = $stmt->fetch(PDO::FETCH_ASSOC);
 
+// Check if user already reserved this book
+$stmt = $pdo->prepare("
+    SELECT * FROM reservations 
+    WHERE user_id = ? AND book_id = ? AND status = 'active'
+");
+$stmt->execute([$user_id, $book_id]);
+$current_reservation = $stmt->fetch(PDO::FETCH_ASSOC);
+
+// Check if book is reserved by someone else
+$stmt = $pdo->prepare("
+    SELECT COUNT(*) FROM reservations 
+    WHERE book_id = ? AND status = 'active'
+");
+$stmt->execute([$book_id]);
+$book_reserved_count = $stmt->fetchColumn();
+
 // Get user's current borrowed books count
 $stmt = $pdo->prepare("
     SELECT COUNT(*) FROM borrowing 
-    WHERE user_id = ? AND status IN ('borrowed', 'overdue')
+    WHERE user_id = ? AND status IN ('borrowed', 'overdue', 'pending_return')
 ");
 $stmt->execute([$user_id]);
 $user_borrowed_count = $stmt->fetchColumn();
+
+// Get user's current reservations count
+$stmt = $pdo->prepare("
+    SELECT COUNT(*) FROM reservations 
+    WHERE user_id = ? AND status = 'active'
+");
+$stmt->execute([$user_id]);
+$user_reservations_count = $stmt->fetchColumn();
 
 // Get system settings
 $stmt = $pdo->prepare("
     SELECT setting_key, setting_value 
     FROM system_settings 
-    WHERE setting_key IN ('max_borrow_books', 'max_borrow_days', 'fine_per_day')
+    WHERE setting_key IN ('max_borrow_books', 'max_borrow_days', 'fine_per_day', 'max_reservations')
 ");
 $stmt->execute();
 $settings = [];
@@ -85,6 +109,7 @@ while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
 $max_borrow_books = (int)($settings['max_borrow_books'] ?? 5);
 $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
 $fine_per_day = (float)($settings['fine_per_day'] ?? 5.00);
+$max_reservations = (int)($settings['max_reservations'] ?? 3);
 
 // Check for unpaid fines
 $stmt = $pdo->prepare("SELECT COUNT(*) FROM fines WHERE user_id = ? AND status = 'unpaid'");
@@ -111,7 +136,7 @@ $stmt = $pdo->prepare("
     LEFT JOIN categories c ON b.category_id = c.category_id
     LEFT JOIN book_authors ba ON b.book_id = ba.book_id
     LEFT JOIN authors a ON ba.author_id = a.author_id
-    WHERE b.category_id = ? AND b.book_id != ? AND b.status = 'available'
+    WHERE b.category_id = ? AND b.book_id != ? AND b.status IN ('available', 'reserved')
     GROUP BY b.book_id
     ORDER BY RAND()
     LIMIT 4
@@ -121,6 +146,27 @@ $related_books = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Calculate estimated due date if borrowed today
 $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
+
+// Determine book status for display
+$book_status_display = '';
+$book_action_available = false;
+
+if ($current_borrow) {
+    if ($current_borrow['status'] === 'pending_return') {
+        $book_status_display = 'รอแอดมินยืนยันการคืน';
+    } else {
+        $book_status_display = 'คุณยืมหนังสือเล่มนี้อยู่';
+    }
+} elseif ($current_reservation) {
+    $book_status_display = 'คุณจองหนังสือเล่มนี้แล้ว - รอแอดมินอนุมัติ';
+} elseif ($book['status'] === 'reserved' || $book_reserved_count > 0) {
+    $book_status_display = 'ถูกจองแล้ว';
+} elseif ($book['status'] === 'available' && $book['available_copies'] > 0) {
+    $book_status_display = 'พร้อมให้จอง';
+    $book_action_available = true;
+} else {
+    $book_status_display = 'ไม่พร้อมให้บริการ';
+}
 ?>
 
 <!DOCTYPE html>
@@ -275,6 +321,11 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
 
         .limited {
             background: #ff9800;
+            color: white;
+        }
+
+        .reserved {
+            background: #9c27b0;
             color: white;
         }
 
@@ -446,7 +497,151 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
             margin-bottom: 1rem;
         }
 
-        /* Additional Info Sections */
+        .success-message {
+            background: rgba(40,167,69,0.2);
+            border: 2px solid rgba(40,167,69,0.3);
+            color: #d4edda;
+            padding: 1rem;
+            border-radius: 10px;
+            margin-bottom: 1rem;
+        }
+
+        /* Modal Styles */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 9999;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            backdrop-filter: blur(5px);
+        }
+
+        .modal-content {
+            background-color: white;
+            margin: 5% auto;
+            padding: 0;
+            border-radius: 15px;
+            width: 90%;
+            max-width: 500px;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.3);
+            animation: modalSlideIn 0.3s ease-out;
+        }
+
+        @keyframes modalSlideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-50px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .modal-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 1.5rem;
+            border-radius: 15px 15px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-header h3 {
+            margin: 0;
+            font-size: 1.3rem;
+        }
+
+        .close {
+            color: white;
+            font-size: 2rem;
+            font-weight: bold;
+            cursor: pointer;
+            line-height: 1;
+            background: none;
+            border: none;
+        }
+
+        .close:hover {
+            opacity: 0.7;
+        }
+
+        .modal-body {
+            padding: 2rem;
+        }
+
+        .modal-book-info {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            padding: 1rem;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+
+        .modal-book-cover {
+            width: 60px;
+            height: 80px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 1.5rem;
+        }
+
+        .modal-book-details h4 {
+            margin: 0 0 0.5rem 0;
+            color: #333;
+        }
+
+        .modal-book-details p {
+            margin: 0;
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 1rem;
+            justify-content: flex-end;
+        }
+
+        .btn-modal {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .btn-modal-primary {
+            background: #667eea;
+            color: white;
+        }
+
+        .btn-modal-primary:hover {
+            background: #5a6fd8;
+            transform: translateY(-2px);
+        }
+
+        .btn-modal-secondary {
+            background: #f8f9fa;
+            color: #666;
+            border: 2px solid #e1e5e9;
+        }
+
+        .btn-modal-secondary:hover {
+            background: #e9ecef;
+        }
+
+        /* Additional styles from original file continue... */
         .info-grid {
             display: grid;
             grid-template-columns: 2fr 1fr;
@@ -480,7 +675,6 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
             font-size: 1.3rem;
         }
 
-        /* History List */
         .history-item {
             display: flex;
             align-items: center;
@@ -516,7 +710,6 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
             font-size: 0.9rem;
         }
 
-        /* Related Books */
         .related-books {
             background: white;
             border-radius: 15px;
@@ -591,6 +784,115 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
             background: #5a6fd8;
         }
 
+        .book-stats {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+
+        .stat-icon {
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 1.2rem;
+        }
+
+        .stat-content {
+            flex: 1;
+        }
+
+        .stat-number {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 0.25rem;
+        }
+
+        .stat-label {
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 2rem;
+            color: #666;
+        }
+
+        .empty-state i {
+            font-size: 3rem;
+            color: #ddd;
+            margin-bottom: 1rem;
+        }
+
+        .loading {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 9999;
+            justify-content: center;
+            align-items: center;
+            color: white;
+        }
+
+        .spinner {
+            border: 4px solid rgba(255,255,255,0.3);
+            border-top: 4px solid white;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 1rem;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .notification {
+            position: fixed;
+            top: 100px;
+            right: 20px;
+            padding: 1rem 1.5rem;
+            border-radius: 10px;
+            color: white;
+            font-weight: 500;
+            z-index: 9998;
+            transform: translateX(100%);
+            transition: transform 0.3s ease;
+        }
+
+        .notification.show {
+            transform: translateX(0);
+        }
+
+        .notification.success {
+            background: #4caf50;
+        }
+
+        .notification.error {
+            background: #f44336;
+        }
+
         /* Mobile Responsive */
         @media (max-width: 768px) {
             .nav-links {
@@ -632,74 +934,24 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
             .related-books-grid {
                 grid-template-columns: repeat(2, 1fr);
             }
-        }
 
-        /* Loading Animation */
-        .loading {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 9999;
-            justify-content: center;
-            align-items: center;
-            color: white;
-        }
+            .modal-content {
+                margin: 10% auto;
+                width: 95%;
+            }
 
-        .spinner {
-            border: 4px solid rgba(255,255,255,0.3);
-            border-top: 4px solid white;
-            border-radius: 50%;
-            width: 50px;
-            height: 50px;
-            animation: spin 1s linear infinite;
-            margin-bottom: 1rem;
-        }
+            .modal-actions {
+                flex-direction: column;
+            }
 
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
+            .stat-item {
+                flex-direction: column;
+                text-align: center;
+            }
 
-        /* Notification */
-        .notification {
-            position: fixed;
-            top: 100px;
-            right: 20px;
-            padding: 1rem 1.5rem;
-            border-radius: 10px;
-            color: white;
-            font-weight: 500;
-            z-index: 9998;
-            transform: translateX(100%);
-            transition: transform 0.3s ease;
-        }
-
-        .notification.show {
-            transform: translateX(0);
-        }
-
-        .notification.success {
-            background: #4caf50;
-        }
-
-        .notification.error {
-            background: #f44336;
-        }
-
-        .empty-state {
-            text-align: center;
-            padding: 2rem;
-            color: #666;
-        }
-
-        .empty-state i {
-            font-size: 3rem;
-            color: #ddd;
-            margin-bottom: 1rem;
+            .stat-icon {
+                margin-bottom: 0.5rem;
+            }
         }
     </style>
 </head>
@@ -743,18 +995,21 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
                         <?php endif; ?>
                     </div>
                     <div class="availability-badge <?php 
-                        echo $book['available_copies'] > 5 ? 'available' : 
-                             ($book['available_copies'] > 0 ? 'limited' : 'unavailable'); 
-                    ?>">
-                        <?php 
-                        if ($book['available_copies'] > 5) {
-                            echo 'พร้อมให้บริการ';
+                        if ($current_borrow) {
+                            echo 'unavailable';
+                        } elseif ($current_reservation) {
+                            echo 'reserved';
+                        } elseif ($book['status'] === 'reserved' || $book_reserved_count > 0) {
+                            echo 'reserved';
+                        } elseif ($book['available_copies'] > 5) {
+                            echo 'available';
                         } elseif ($book['available_copies'] > 0) {
-                            echo 'เหลือน้อย (' . $book['available_copies'] . ' เล่ม)';
+                            echo 'limited';
                         } else {
-                            echo 'ไม่ว่าง';
+                            echo 'unavailable';
                         }
-                        ?>
+                    ?>">
+                        <?php echo $book_status_display; ?>
                     </div>
                 </div>
 
@@ -823,40 +1078,73 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
                         <div class="borrow-stat-label">หนังสือที่คุณยืมอยู่</div>
                     </div>
                     <div class="borrow-stat">
-                        <div class="borrow-stat-number"><?php echo $max_borrow_days; ?></div>
-                        <div class="borrow-stat-label">วันที่อนุญาตให้ยืม</div>
+                        <div class="borrow-stat-number"><?php echo $user_reservations_count; ?>/<?php echo $max_reservations; ?></div>
+                        <div class="borrow-stat-label">หนังสือที่คุณจองอยู่</div>
                     </div>
                     <div class="borrow-stat">
-                        <div class="borrow-stat-number"><?php echo number_format($fine_per_day, 2); ?></div>
-                        <div class="borrow-stat-label">ค่าปรับต่อวัน (บาท)</div>
+                        <div class="borrow-stat-number"><?php echo $max_borrow_days; ?></div>
+                        <div class="borrow-stat-label">วันที่อนุญาตให้ยืม</div>
                     </div>
                 </div>
 
                 <?php if ($current_borrow): ?>
+                    <?php if ($current_borrow['status'] === 'pending_return'): ?>
+                        <div class="success-message">
+                            <i class="fas fa-clock"></i>
+                            คุณได้แจ้งคืนหนังสือเล่มนี้แล้ว รอแอดมินยืนยันการคืน
+                        </div>
+                        <div class="borrow-actions">
+                            <a href="users/dashboard.php" class="btn btn-secondary">
+                                <i class="fas fa-tachometer-alt"></i>
+                                ไปที่แดชบอร์ด
+                            </a>
+                            <a href="users/history.php" class="btn btn-secondary">
+                                <i class="fas fa-history"></i>
+                                ดูประวัติการยืม
+                            </a>
+                        </div>
+                    <?php else: ?>
+                        <div class="warning-message">
+                            <i class="fas fa-info-circle"></i>
+                            คุณได้ยืมหนังสือเล่มนี้แล้วในวันที่ <?php echo date('d/m/Y', strtotime($current_borrow['borrow_date'])); ?>
+                            กำหนดคืนวันที่ <?php echo date('d/m/Y', strtotime($current_borrow['due_date'])); ?>
+                        </div>
+                        <div class="borrow-actions">
+                            <button class="btn btn-primary" onclick="showReturnModal()">
+                                <i class="fas fa-undo"></i>
+                                แจ้งคืนหนังสือ
+                            </button>
+                            <a href="users/history.php" class="btn btn-secondary">
+                                <i class="fas fa-history"></i>
+                                ดูประวัติการยืม
+                            </a>
+                        </div>
+                    <?php endif; ?>
+                <?php elseif ($current_reservation): ?>
                     <div class="warning-message">
-                        <i class="fas fa-info-circle"></i>
-                        คุณได้ยืมหนังสือเล่มนี้แล้วในวันที่ <?php echo date('d/m/Y', strtotime($current_borrow['borrow_date'])); ?>
-                        กำหนดคืนวันที่ <?php echo date('d/m/Y', strtotime($current_borrow['due_date'])); ?>
+                        <i class="fas fa-clock"></i>
+                        คุณได้จองหนังสือเล่มนี้แล้วเมื่อ <?php echo date('d/m/Y H:i', strtotime($current_reservation['reservation_date'])); ?>
+                        <br>กำหนดหมดอายุ: <?php echo date('d/m/Y H:i', strtotime($current_reservation['expiry_date'])); ?>
                     </div>
                     <div class="borrow-actions">
-                        <button class="btn btn-secondary" onclick="returnBook(<?php echo $current_borrow['borrow_id']; ?>)">
-                            <i class="fas fa-undo"></i>
-                            คืนหนังสือ
+                        <button class="btn btn-secondary" onclick="cancelReservation(<?php echo $current_reservation['reservation_id']; ?>)">
+                            <i class="fas fa-times"></i>
+                            ยกเลิกการจอง
                         </button>
-                        <a href="users/history.php" class="btn btn-secondary">
-                            <i class="fas fa-history"></i>
-                            ดูประวัติการยืม
+                        <a href="users/dashboard.php" class="btn btn-secondary">
+                            <i class="fas fa-tachometer-alt"></i>
+                            ไปที่แดชบอร์ด
                         </a>
                     </div>
                 <?php elseif ($unpaid_fines > 0): ?>
                     <div class="error-message">
                         <i class="fas fa-exclamation-triangle"></i>
-                        คุณมีค่าปรับที่ยังไม่ได้ชำระ กรุณาชำระค่าปรับก่อนยืมหนังสือใหม่
+                        คุณมีค่าปรับที่ยังไม่ได้ชำระ กรุณาชำระค่าปรับก่อนจองหนังสือใหม่
                     </div>
                     <div class="borrow-actions">
                         <button class="btn btn-primary" disabled>
                             <i class="fas fa-ban"></i>
-                            ไม่สามารถยืมได้
+                            ไม่สามารถจองได้
                         </button>
                         <a href="users/profile.php" class="btn btn-secondary">
                             <i class="fas fa-credit-card"></i>
@@ -871,22 +1159,52 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
                     <div class="borrow-actions">
                         <button class="btn btn-primary" disabled>
                             <i class="fas fa-ban"></i>
-                            ไม่สามารถยืมได้
+                            ไม่สามารถจองได้
                         </button>
                         <a href="users/dashboard.php" class="btn btn-secondary">
                             <i class="fas fa-book-reader"></i>
                             ดูหนังสือที่ยืมอยู่
                         </a>
                     </div>
-                <?php elseif ($book['available_copies'] <= 0): ?>
+                <?php elseif ($user_reservations_count >= $max_reservations): ?>
                     <div class="error-message">
-                        <i class="fas fa-times-circle"></i>
-                        หนังสือเล่มนี้ถูกยืมหมดแล้ว กรุณาลองใหม่ภายหลัง
+                        <i class="fas fa-exclamation-triangle"></i>
+                        คุณจองหนังสือครบจำนวนสูงสุดแล้ว (<?php echo $max_reservations; ?> เล่ม) กรุณายกเลิกการจองบางเล่มก่อน
                     </div>
                     <div class="borrow-actions">
                         <button class="btn btn-primary" disabled>
                             <i class="fas fa-ban"></i>
-                            ไม่สามารถยืมได้
+                            ไม่สามารถจองได้
+                        </button>
+                        <a href="users/dashboard.php" class="btn btn-secondary">
+                            <i class="fas fa-bookmark"></i>
+                            ดูหนังสือที่จองอยู่
+                        </a>
+                    </div>
+                <?php elseif ($book['status'] === 'reserved' || $book_reserved_count > 0): ?>
+                    <div class="error-message">
+                        <i class="fas fa-bookmark"></i>
+                        หนังสือเล่มนี้ถูกจองแล้ว กรุณาลองใหม่ภายหลัง
+                    </div>
+                    <div class="borrow-actions">
+                        <button class="btn btn-primary" disabled>
+                            <i class="fas fa-ban"></i>
+                            ไม่สามารถจองได้
+                        </button>
+                        <button class="btn btn-secondary" onclick="notifyWhenAvailable(<?php echo $book_id; ?>)">
+                            <i class="fas fa-bell"></i>
+                            แจ้งเตือนเมื่อว่าง
+                        </button>
+                    </div>
+                <?php elseif ($book['available_copies'] <= 0): ?>
+                    <div class="error-message">
+                        <i class="fas fa-times-circle"></i>
+                        หนังสือเล่มนี้ไม่มีให้บริการในขณะนี้
+                    </div>
+                    <div class="borrow-actions">
+                        <button class="btn btn-primary" disabled>
+                            <i class="fas fa-ban"></i>
+                            ไม่สามารถจองได้
                         </button>
                         <button class="btn btn-secondary" onclick="notifyWhenAvailable(<?php echo $book_id; ?>)">
                             <i class="fas fa-bell"></i>
@@ -901,18 +1219,18 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
                     <div class="borrow-actions">
                         <button class="btn btn-primary" disabled>
                             <i class="fas fa-ban"></i>
-                            ไม่สามารถยืมได้
+                            ไม่สามารถจองได้
                         </button>
                     </div>
                 <?php else: ?>
                     <div class="warning-message">
                         <i class="fas fa-info-circle"></i>
-                        หากยืมวันนี้ กำหนดคืนวันที่ <?php echo date('d/m/Y', strtotime($estimated_due_date)); ?>
+                        การจองจะมีอายุ 1 วัน รอแอดมินอนุมัติก่อนเริ่มนับวันคืน
                     </div>
                     <div class="borrow-actions">
-                        <button class="btn btn-primary" onclick="borrowBook(<?php echo $book_id; ?>)">
-                            <i class="fas fa-hand-holding"></i>
-                            ยืมหนังสือเล่มนี้
+                        <button class="btn btn-primary" onclick="showReservationModal()">
+                            <i class="fas fa-bookmark"></i>
+                            จองหนังสือเล่มนี้
                         </button>
                         <button class="btn btn-secondary" onclick="addToWishlist(<?php echo $book_id; ?>)">
                             <i class="fas fa-heart"></i>
@@ -1029,6 +1347,106 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
         <?php endif; ?>
     </div>
 
+    <!-- Reservation Modal -->
+    <div id="reservationModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-bookmark"></i> ยืนยันการจองหนังสือ</h3>
+                <button class="close" onclick="closeModal('reservationModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-book-info">
+                    <div class="modal-book-cover">
+                        <?php if (!empty($book['cover_image'])): ?>
+                            <img src="<?php echo htmlspecialchars($book['cover_image']); ?>" 
+                                 alt="<?php echo htmlspecialchars($book['title']); ?>"
+                                 style="width: 100%; height: 100%; object-fit: cover; border-radius: 8px;">
+                        <?php else: ?>
+                            <i class="fas fa-book"></i>
+                        <?php endif; ?>
+                    </div>
+                    <div class="modal-book-details">
+                        <h4><?php echo htmlspecialchars($book['title']); ?></h4>
+                        <p><i class="fas fa-user"></i> <?php echo htmlspecialchars($book['authors'] ?: 'ไม่ระบุผู้เขียน'); ?></p>
+                        <p><i class="fas fa-tag"></i> <?php echo htmlspecialchars($book['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?></p>
+                    </div>
+                </div>
+                
+                <div style="background: #f8f9fa; padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">
+                    <h4 style="color: #333; margin-bottom: 0.5rem;"><i class="fas fa-info-circle"></i> ข้อมูลการจอง</h4>
+                    <p style="margin: 0.25rem 0; color: #666;"><strong>วันที่จอง:</strong> <?php echo date('d/m/Y H:i'); ?></p>
+                    <p style="margin: 0.25rem 0; color: #666;"><strong>หมดอายุ:</strong> <?php echo date('d/m/Y H:i', strtotime('+1 day')); ?></p>
+                    <p style="margin: 0.25rem 0; color: #666;"><strong>สถานะ:</strong> รอแอดมินอนุมัติ</p>
+                </div>
+
+                <div style="background: #fff3cd; border: 1px solid #ffeaa7; padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">
+                    <p style="margin: 0; color: #856404;"><i class="fas fa-exclamation-triangle"></i> 
+                    <strong>หมายเหตุ:</strong> การจองจะมีอายุ 1 วัน หากแอดมินไม่อนุมัติภายในเวลาที่กำหนด การจองจะหมดอายุโดยอัตโนมัติ</p>
+                </div>
+
+                <div class="modal-actions">
+                    <button class="btn-modal btn-modal-secondary" onclick="closeModal('reservationModal')">
+                        <i class="fas fa-times"></i> ยกเลิก
+                    </button>
+                    <button class="btn-modal btn-modal-primary" onclick="confirmReservation(<?php echo $book_id; ?>)">
+                        <i class="fas fa-bookmark"></i> ยืนยันการจอง
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Return Request Modal -->
+    <div id="returnModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-undo"></i> แจ้งคืนหนังสือ</h3>
+                <button class="close" onclick="closeModal('returnModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-book-info">
+                    <div class="modal-book-cover">
+                        <?php if (!empty($book['cover_image'])): ?>
+                            <img src="<?php echo htmlspecialchars($book['cover_image']); ?>" 
+                                 alt="<?php echo htmlspecialchars($book['title']); ?>"
+                                 style="width: 100%; height: 100%; object-fit: cover; border-radius: 8px;">
+                        <?php else: ?>
+                            <i class="fas fa-book"></i>
+                        <?php endif; ?>
+                    </div>
+                    <div class="modal-book-details">
+                        <h4><?php echo htmlspecialchars($book['title']); ?></h4>
+                        <p><i class="fas fa-user"></i> <?php echo htmlspecialchars($book['authors'] ?: 'ไม่ระบุผู้เขียน'); ?></p>
+                        <?php if ($current_borrow): ?>
+                            <p><i class="fas fa-calendar"></i> ยืมเมื่อ: <?php echo date('d/m/Y', strtotime($current_borrow['borrow_date'])); ?></p>
+                            <p><i class="fas fa-calendar-alt"></i> กำหนดคืน: <?php echo date('d/m/Y', strtotime($current_borrow['due_date'])); ?></p>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                
+                <div style="background: #f8f9fa; padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">
+                    <h4 style="color: #333; margin-bottom: 0.5rem;"><i class="fas fa-info-circle"></i> การแจ้งคืน</h4>
+                    <p style="margin: 0.25rem 0; color: #666;">เมื่อคุณกดยืนยัน ระบบจะส่งคำขอคืนหนังสือไปยังแอดมิน</p>
+                    <p style="margin: 0.25rem 0; color: #666;">แอดมินจะตรวจสอบสภาพหนังสือและยืนยันการคืน</p>
+                </div>
+
+                <div style="background: #d1ecf1; border: 1px solid #bee5eb; padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">
+                    <p style="margin: 0; color: #0c5460;"><i class="fas fa-lightbulb"></i> 
+                    <strong>คำแนะนำ:</strong> กรุณานำหนังสือไปคืนที่เคาน์เตอร์ห้องสมุด</p>
+                </div>
+
+                <div class="modal-actions">
+                    <button class="btn-modal btn-modal-secondary" onclick="closeModal('returnModal')">
+                        <i class="fas fa-times"></i> ยกเลิก
+                    </button>
+                    <button class="btn-modal btn-modal-primary" onclick="confirmReturn(<?php echo $current_borrow['borrow_id'] ?? 0; ?>)">
+                        <i class="fas fa-undo"></i> ยืนยันแจ้งคืน
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Loading Overlay -->
     <div class="loading" id="loadingOverlay">
         <div>
@@ -1036,7 +1454,6 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
             <p>กำลังดำเนินการ...</p>
         </div>
     </div>
-
     <style>
         .book-stats {
             display: flex;
@@ -1093,13 +1510,40 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
         }
     </style>
 
-    <script>
-        // Borrow book function
-        function borrowBook(bookId) {
-            if (confirm('คุณต้องการยืมหนังสือ "<?php echo addslashes($book['title']); ?>" หรือไม่?\n\nกำหนดคืน: <?php echo date('d/m/Y', strtotime($estimated_due_date)); ?>')) {
+<script>
+        // Modal functions
+        function showReservationModal() {
+            document.getElementById('reservationModal').style.display = 'block';
+        }
+
+        function showReturnModal() {
+            document.getElementById('returnModal').style.display = 'block';
+        }
+
+        function closeModal(modalId) {
+            document.getElementById(modalId).style.display = 'none';
+        }
+
+        // Close modal when clicking outside
+        window.onclick = function(event) {
+            const reservationModal = document.getElementById('reservationModal');
+            const returnModal = document.getElementById('returnModal');
+            
+            if (event.target == reservationModal) {
+                reservationModal.style.display = 'none';
+            }
+            if (event.target == returnModal) {
+                returnModal.style.display = 'none';
+            }
+        }
+
+        // Reservation function
+        function confirmReservation(bookId) {
+            if (confirm('คุณต้องการจองหนังสือ "<?php echo addslashes($book['title']); ?>" หรือไม่?\n\nการจองจะมีอายุ 1 วัน และต้องรอแอดมินอนุมัติ')) {
                 showLoading();
+                closeModal('reservationModal');
                 
-                fetch('users/borrow_book.php', {
+                fetch('users/reserve_book.php', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1112,7 +1556,7 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
                 .then(data => {
                     hideLoading();
                     if (data.success) {
-                        showNotification('ยืมหนังสือสำเร็จ! กรุณาคืนภายในกำหนด', 'success');
+                        showNotification('จองหนังสือสำเร็จ! รอแอดมินอนุมัติ', 'success');
                         setTimeout(() => {
                             location.reload();
                         }, 2000);
@@ -1128,27 +1572,60 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
             }
         }
 
-        // Return book function
-        function returnBook(borrowId) {
-            if (confirm('คุณต้องการคืนหนังสือ "<?php echo addslashes($book['title']); ?>" หรือไม่?')) {
+        // Return request function
+        function confirmReturn(borrowId) {
+            if (confirm('คุณต้องการแจ้งคืนหนังสือ "<?php echo addslashes($book['title']); ?>" หรือไม่?\n\nกรุณานำหนังสือไปคืนที่เคาน์เตอร์ห้องสมุด')) {
                 showLoading();
+                closeModal('returnModal');
                 
-                fetch('users/return_book.php', {
+                fetch('users/request_return.php', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        borrow_id: borrowId,
-                        condition: 'good',
-                        notes: 'คืนผ่านระบบออนไลน์'
+                        borrow_id: borrowId
                     })
                 })
                 .then(response => response.json())
                 .then(data => {
                     hideLoading();
                     if (data.success) {
-                        showNotification('คืนหนังสือสำเร็จ!', 'success');
+                        showNotification('แจ้งคืนหนังสือสำเร็จ! รอแอดมินยืนยัน', 'success');
+                        setTimeout(() => {
+                            location.reload();
+                        }, 2000);
+                    } else {
+                        showNotification('เกิดข้อผิดพลาด: ' + data.message, 'error');
+                    }
+                })
+                .catch(error => {
+                    hideLoading();
+                    showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ', 'error');
+                    console.error('Error:', error);
+                });
+            }
+        }
+
+        // Cancel reservation function
+        function cancelReservation(reservationId) {
+            if (confirm('คุณต้องการยกเลิกการจองหนังสือ "<?php echo addslashes($book['title']); ?>" หรือไม่?')) {
+                showLoading();
+                
+                fetch('users/cancel_reservation.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        reservation_id: reservationId
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    hideLoading();
+                    if (data.success) {
+                        showNotification('ยกเลิกการจองเรียบร้อยแล้ว', 'success');
                         setTimeout(() => {
                             location.reload();
                         }, 2000);
@@ -1220,27 +1697,28 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
 
         // Keyboard shortcuts
         document.addEventListener('keydown', function(e) {
-            // B for borrow (if available)
-            if (e.key.toLowerCase() === 'b' && !e.ctrlKey && !e.altKey) {
-                const borrowBtn = document.querySelector('.btn-primary:not([disabled])');
-                if (borrowBtn && borrowBtn.textContent.includes('ยืม')) {
+            // R for reserve (if available)
+            if (e.key.toLowerCase() === 'r' && !e.ctrlKey && !e.altKey) {
+                const reserveBtn = document.querySelector('button[onclick="showReservationModal()"]');
+                if (reserveBtn && !reserveBtn.disabled) {
                     e.preventDefault();
-                    borrowBtn.click();
+                    showReservationModal();
                 }
             }
             
-            // R for return (if borrowed)
-            if (e.key.toLowerCase() === 'r' && !e.ctrlKey && !e.altKey) {
-                const returnBtn = document.querySelector('button[onclick*="returnBook"]');
+            // T for return (if borrowed)
+            if (e.key.toLowerCase() === 't' && !e.ctrlKey && !e.altKey) {
+                const returnBtn = document.querySelector('button[onclick="showReturnModal()"]');
                 if (returnBtn) {
                     e.preventDefault();
-                    returnBtn.click();
+                    showReturnModal();
                 }
             }
             
-            // Escape to go back
+            // Escape to close modals
             if (e.key === 'Escape') {
-                window.location.href = 'users/index_user.php';
+                closeModal('reservationModal');
+                closeModal('returnModal');
             }
         });
 
@@ -1294,27 +1772,6 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
             observer.observe(element);
         });
 
-        // Print book details
-        function printBookDetails() {
-            window.print();
-        }
-
-        // Share book (placeholder)
-        function shareBook() {
-            if (navigator.share) {
-                navigator.share({
-                    title: '<?php echo addslashes($book['title']); ?>',
-                    text: 'ดูหนังสือเล่มนี้ที่ห้องสมุดดิจิทัล',
-                    url: window.location.href
-                });
-            } else {
-                // Fallback: copy URL to clipboard
-                navigator.clipboard.writeText(window.location.href).then(() => {
-                    showNotification('คัดลอกลิงก์แล้ว', 'success');
-                });
-            }
-        }
-
         // Enhanced book card interactions
         document.querySelectorAll('.related-book-card').forEach(card => {
             card.addEventListener('mouseenter', function() {
@@ -1330,7 +1787,7 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
 
         // Console branding
         console.log('%cห้องสมุดดิจิทัล - วิทยาลัยเทคนิคหาดใหญ่', 'color: #667eea; font-size: 20px; font-weight: bold;');
-        console.log('%cBook Details Page - Developed with ❤️', 'color: #764ba2; font-size: 14px;');
+        console.log('%cBook Details Page with Reservation System - Developed with ❤️', 'color: #764ba2; font-size: 14px;');
         console.log('พัฒนาโดย นายปิยพัชร์ ทองวงศ์');
 
         // Performance monitoring
@@ -1346,67 +1803,89 @@ $estimated_due_date = date('Y-m-d', strtotime("+{$max_borrow_days} days"));
             });
         }
 
-        // Add context menu for additional actions
-        document.addEventListener('contextmenu', function(e) {
-            if (e.target.closest('.book-cover') || e.target.closest('.book-title')) {
-                e.preventDefault();
-                
-                // Could show custom context menu here
-                console.log('Book context menu');
+        // Auto-refresh expired reservations (check every 5 minutes)
+        setInterval(function() {
+            // Check if current page reservation might be expired
+            const currentTime = new Date();
+            const reservationWarning = document.querySelector('.warning-message');
+            
+            if (reservationWarning && reservationWarning.textContent.includes('กำหนดหมดอายุ')) {
+                // Could implement more sophisticated expiry checking here
+                console.log('Checking reservation expiry...');
+            }
+        }, 300000); // 5 minutes
+
+        // Add touch support for mobile
+        let touchStartY = 0;
+        document.addEventListener('touchstart', function(e) {
+            touchStartY = e.touches[0].clientY;
+        });
+
+        document.addEventListener('touchend', function(e) {
+            const touchEndY = e.changedTouches[0].clientY;
+            const diff = touchStartY - touchEndY;
+            
+            // Swipe up to refresh (simple implementation)
+            if (diff > 50 && window.pageYOffset === 0) {
+                location.reload();
             }
         });
 
-        // Breadcrumb navigation
-        function updateBreadcrumb() {
-            const breadcrumb = document.createElement('nav');
-            breadcrumb.className = 'breadcrumb';
-            breadcrumb.innerHTML = `
-                <a href="users/index_user.php">หน้าแรก</a>
-                <span>/</span>
-                <span><?php echo htmlspecialchars($book['category_name'] ?: 'หนังสือ'); ?></span>
-                <span>/</span>
-                <span><?php echo htmlspecialchars($book['title']); ?></span>
-            `;
-            
-            const mainContent = document.querySelector('.main-content');
-            mainContent.insertBefore(breadcrumb, mainContent.firstChild);
+        // Service Worker registration for PWA features
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function() {
+                navigator.serviceWorker.register('/sw.js')
+                    .then(function(registration) {
+                        console.log('ServiceWorker registration successful');
+                    })
+                    .catch(function(err) {
+                        console.log('ServiceWorker registration failed');
+                    });
+            });
         }
 
-        // Call breadcrumb function
-        updateBreadcrumb();
+        // Detect network status
+        window.addEventListener('online', function() {
+            showNotification('เชื่อมต่ออินเทอร์เน็ตแล้ว', 'success');
+        });
 
-        // Add breadcrumb styles
-        const breadcrumbStyles = document.createElement('style');
-        breadcrumbStyles.textContent = `
-            .breadcrumb {
-                background: white;
-                padding: 1rem;
-                border-radius: 10px;
-                margin-bottom: 1rem;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                font-size: 0.9rem;
-            }
-            
-            .breadcrumb a {
-                color: #667eea;
-                text-decoration: none;
-            }
-            
-            .breadcrumb a:hover {
-                text-decoration: underline;
-            }
-            
-            .breadcrumb span {
-                color: #666;
-                margin: 0 0.5rem;
-            }
-            
-            .breadcrumb span:last-child {
-                color: #333;
-                font-weight: 500;
-            }
-        `;
-        document.head.appendChild(breadcrumbStyles);
+        window.addEventListener('offline', function() {
+            showNotification('ไม่มีการเชื่อมต่ออินเทอร์เน็ต', 'error');
+        });
+
+        // Initialize tooltips and other UI enhancements
+        document.addEventListener('DOMContentLoaded', function() {
+            // Add loading states to buttons
+            document.querySelectorAll('.btn, .btn-modal').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    if (!this.disabled && !this.classList.contains('btn-secondary')) {
+                        this.style.opacity = '0.7';
+                        setTimeout(() => {
+                            this.style.opacity = '1';
+                        }, 300);
+                    }
+                });
+            });
+
+            // Auto-focus on modal open
+            const modals = document.querySelectorAll('.modal');
+            modals.forEach(modal => {
+                const observer = new MutationObserver((mutations) => {
+                    mutations.forEach((mutation) => {
+                        if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
+                            if (modal.style.display === 'block') {
+                                const firstButton = modal.querySelector('.btn-modal-primary');
+                                if (firstButton) {
+                                    setTimeout(() => firstButton.focus(), 100);
+                                }
+                            }
+                        }
+                    });
+                });
+                
+                observer.observe(modal, { attributes: true });
+            });
+        });
     </script>
 </body>
 </html>
