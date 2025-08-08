@@ -849,8 +849,7 @@ $stats = $stmt->fetch(PDO::FETCH_ASSOC);
     <!-- Footer -->
     <footer class="footer">
         <div class="footer-container">
-            <p>&copy; 2025 ห้องสมุดดิจิทัล - วิทยาลัยเทคนิคหาดใหญ่. สงวนลิขสิทธิ์.</p>
-            <p>พัฒนาโดย นายปิยพัชร์ ทองวงศ์</p>
+            <p>&copy; 2025 ห้องสมุดดิจิทัล - วิทยาลัยเทคนิคหาดใหญ่</p>
         </div>
     </footer>
 
