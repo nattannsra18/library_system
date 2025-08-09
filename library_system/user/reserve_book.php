@@ -148,10 +148,6 @@ try {
     $stmt->execute([$user_id, $book_id, $reservation_date, $expiry_date]);
     $reservation_id = $pdo->lastInsertId();
 
-    // Update book status to reserved
-    $stmt = $pdo->prepare("UPDATE books SET status = 'reserved' WHERE book_id = ?");
-    $stmt->execute([$book_id]);
-
     // Log activity
     $stmt = $pdo->prepare("
         INSERT INTO activity_logs (user_id, action, table_name, record_id, new_values, ip_address, user_agent) 

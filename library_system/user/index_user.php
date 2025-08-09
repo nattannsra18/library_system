@@ -27,75 +27,21 @@ $stmt = $pdo->prepare("SELECT * FROM users WHERE user_id = ?");
 $stmt->execute([$user_id]);
 $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-// Get search parameters
-$search = isset($_GET['search']) ? trim($_GET['search']) : '';
-$category_id = isset($_GET['category']) ? (int)$_GET['category'] : 0;
-$page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
-$per_page = 12;
-$offset = ($page - 1) * $per_page;
-
 // Get all categories
 $stmt = $pdo->query("SELECT * FROM categories ORDER BY category_name");
 $categories = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Build query for books
-$where_conditions = [];
-$params = [];
+// Get all publishers for advanced filtering
+$stmt = $pdo->query("SELECT DISTINCT p.publisher_id, p.publisher_name FROM publishers p 
+                     INNER JOIN books b ON p.publisher_id = b.publisher_id 
+                     ORDER BY p.publisher_name");
+$publishers = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-if (!empty($search)) {
-    $where_conditions[] = "(b.title LIKE :search OR b.subtitle LIKE :search OR b.isbn LIKE :search OR 
-                          a.first_name LIKE :search OR a.last_name LIKE :search)";
-    $params[':search'] = "%$search%";
-}
-
-if ($category_id > 0) {
-    $where_conditions[] = "b.category_id = :category_id";
-    $params[':category_id'] = $category_id;
-}
-
-$where_conditions[] = "b.status IN ('available', 'unavailable')";
-
-$where_sql = !empty($where_conditions) ? "WHERE " . implode(" AND ", $where_conditions) : "";
-
-// Get books with pagination - แก้ไขส่วนการดึงรูปปก
-$sql = "SELECT DISTINCT b.*, c.category_name, p.publisher_name,
-               GROUP_CONCAT(CONCAT(a.first_name, ' ', a.last_name) SEPARATOR ', ') as authors,
-               b.cover_image
-        FROM books b
-        LEFT JOIN categories c ON b.category_id = c.category_id
-        LEFT JOIN publishers p ON b.publisher_id = p.publisher_id
-        LEFT JOIN book_authors ba ON b.book_id = ba.book_id
-        LEFT JOIN authors a ON ba.author_id = a.author_id
-        $where_sql
-        GROUP BY b.book_id
-        ORDER BY 
-            CASE WHEN b.status = 'available' THEN 1 ELSE 2 END,
-            b.created_at DESC
-        LIMIT :limit OFFSET :offset";
-
-$stmt = $pdo->prepare($sql);
-foreach ($params as $key => $value) {
-    $stmt->bindValue($key, $value);
-}
-$stmt->bindValue(':limit', $per_page, PDO::PARAM_INT);
-$stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
-$stmt->execute();
-$books = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Get total count for pagination
-$count_sql = "SELECT COUNT(DISTINCT b.book_id) as total
-              FROM books b
-              LEFT JOIN book_authors ba ON b.book_id = ba.book_id
-              LEFT JOIN authors a ON ba.author_id = a.author_id
-              $where_sql";
-
-$stmt = $pdo->prepare($count_sql);
-foreach ($params as $key => $value) {
-    $stmt->bindValue($key, $value);
-}
-$stmt->execute();
-$total_books = $stmt->fetchColumn();
-$total_pages = ceil($total_books / $per_page);
+// Get all authors for advanced filtering
+$stmt = $pdo->query("SELECT DISTINCT a.author_id, a.first_name, a.last_name FROM authors a 
+                     INNER JOIN book_authors ba ON a.author_id = ba.author_id
+                     ORDER BY a.first_name, a.last_name");
+$authors = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Get library stats
 $stats_query = "SELECT 
@@ -123,22 +69,31 @@ $recent_activity_count = $stmt->fetchColumn();
 
 // Get recommended books based on user's history or popular books
 $stmt = $pdo->prepare("
-    SELECT b.*, c.category_name, 
+    SELECT b.*, c.category_name, p.publisher_name,
            GROUP_CONCAT(CONCAT(a.first_name, ' ', a.last_name) SEPARATOR ', ') as authors,
-           b.cover_image
+           b.cover_image,
+           -- เช็คว่าหนังสือถูกจองโดยใครบ้าง
+           (SELECT COUNT(*) FROM reservations r WHERE r.book_id = b.book_id AND r.status = 'active') as reserved_count,
+           -- เช็คว่าหนังสือถูกจองโดยผู้ใช้คนนี้หรือไม่
+           (SELECT COUNT(*) FROM reservations r WHERE r.book_id = b.book_id AND r.user_id = ? AND r.status = 'active') as user_reserved
     FROM books b
     LEFT JOIN categories c ON b.category_id = c.category_id
+    LEFT JOIN publishers p ON b.publisher_id = p.publisher_id
     LEFT JOIN book_authors ba ON b.book_id = ba.book_id
     LEFT JOIN authors a ON ba.author_id = a.author_id
-    WHERE b.status IN ('available', 'unavailable')
+    WHERE b.status IN ('available', 'unavailable', 'reserved')
     GROUP BY b.book_id
     ORDER BY 
-        CASE WHEN b.status = 'available' THEN 1 ELSE 2 END,
+        CASE 
+            WHEN b.status = 'available' THEN 1 
+            WHEN b.status = 'reserved' THEN 2
+            ELSE 3 
+        END,
         RAND()
     LIMIT 6
 ");
 
-$stmt->execute();
+$stmt->execute([$user_id]);
 $recommended_books = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Get notifications
@@ -161,17 +116,13 @@ while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
 $max_borrow_books = (int)($settings['max_borrow_books'] ?? 5);
 $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
 
-// Function to get cover image path - แก้ไขเป็น relative path ที่ถูกต้อง
-function getCoverImagePath($cover_image) {
+// Function to check if cover image exists
+function checkCoverImageExists($cover_image) {
     if (!empty($cover_image)) {
-        // ตรวจสอบว่าไฟล์มีอยู่จริงหรือไม่ (ใช้ absolute path สำหรับการตรวจสอบ)
-        $absolute_path = "../uploads/covers/" . $cover_image;
-        if (file_exists($absolute_path)) {
-            // Return relative path สำหรับการแสดงผลใน HTML
-            return "../uploads/covers/" . $cover_image;
-        }
+        $image_path = "../" . $cover_image;
+        return file_exists($image_path);
     }
-    return null;
+    return false;
 }
 ?>
 
@@ -338,7 +289,7 @@ function getCoverImagePath($cover_image) {
         }
 
         .search-container {
-            max-width: 800px;
+            max-width: 900px;
             margin: 0 auto;
             padding: 0 2rem;
             position: relative;
@@ -351,40 +302,239 @@ function getCoverImagePath($cover_image) {
             margin-bottom: 2rem;
         }
 
+        .search-form-wrapper {
+            position: relative;
+            margin-bottom: 2rem;
+        }
+
         .search-form {
             background: #f8f9fa;
             border-radius: 50px;
             padding: 10px;
             display: flex;
             box-shadow: 0 8px 25px rgba(0,0,0,0.1);
-            margin-bottom: 2rem;
+            position: relative;
+            transition: all 0.3s ease;
+        }
+
+        .search-form.focused {
+            box-shadow: 0 12px 35px rgba(102, 126, 234, 0.2);
+            transform: translateY(-2px);
+        }
+
+        .search-input-wrapper {
+            flex: 1;
             position: relative;
         }
 
         .search-input {
-            flex: 1;
+            width: 100%;
             border: none;
-            padding: 1rem 1.5rem;
+            padding: 1rem 1.5rem 1rem 3rem;
             font-size: 1.1rem;
             border-radius: 40px;
             outline: none;
             background: transparent;
-        }
-
-        .search-btn {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 1rem 2rem;
-            border-radius: 40px;
-            cursor: pointer;
-            font-size: 1.1rem;
             transition: all 0.3s ease;
         }
 
-        .search-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        .search-input:focus {
+            padding-left: 3.5rem;
+        }
+
+        .search-input-icon {
+            position: absolute;
+            left: 1.5rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #667eea;
+            font-size: 1.2rem;
+            transition: all 0.3s ease;
+        }
+
+        .search-input:focus + .search-input-icon {
+            left: 1.8rem;
+            color: #764ba2;
+        }
+
+        .search-clear-btn {
+            position: absolute;
+            right: 1rem;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            color: #999;
+            cursor: pointer;
+            padding: 0.5rem;
+            border-radius: 50%;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .search-clear-btn.visible {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .search-clear-btn:hover {
+            background: #f0f0f0;
+            color: #667eea;
+        }
+
+        .search-suggestions {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+            z-index: 1000;
+            margin-top: 0.5rem;
+            max-height: 300px;
+            overflow-y: auto;
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(-10px);
+            transition: all 0.3s ease;
+        }
+
+        .search-suggestions.visible {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+
+        .suggestion-item {
+            padding: 1rem 1.5rem;
+            cursor: pointer;
+            border-bottom: 1px solid #f0f0f0;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .suggestion-item:hover {
+            background: #f8f9fa;
+            padding-left: 2rem;
+        }
+
+        .suggestion-item:last-child {
+            border-bottom: none;
+        }
+
+        .suggestion-icon {
+            color: #667eea;
+            width: 20px;
+        }
+
+        .suggestion-text {
+            flex: 1;
+        }
+
+        .suggestion-type {
+            font-size: 0.8rem;
+            color: #999;
+            background: #f0f0f0;
+            padding: 0.2rem 0.8rem;
+            border-radius: 10px;
+        }
+
+        .advanced-filters {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            border: 2px solid transparent;
+            transition: all 0.3s ease;
+        }
+
+        .advanced-filters.expanded {
+            border-color: #667eea;
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.1);
+        }
+
+        .filters-header {
+            display: flex;
+            justify-content: between;
+            align-items: center;
+            margin-bottom: 1rem;
+            cursor: pointer;
+        }
+
+        .filters-toggle {
+            background: none;
+            border: none;
+            color: #667eea;
+            font-size: 1rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem;
+            border-radius: 8px;
+            transition: all 0.3s ease;
+        }
+
+        .filters-toggle:hover {
+            background: rgba(102, 126, 234, 0.1);
+        }
+
+        .filters-toggle i {
+            transition: transform 0.3s ease;
+        }
+
+        .filters-toggle.expanded i {
+            transform: rotate(180deg);
+        }
+
+        .filters-content {
+            max-height: 0;
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .filters-content.expanded {
+            max-height: 500px;
+        }
+
+        .filter-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+        }
+
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .filter-label {
+            font-weight: 600;
+            color: #333;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .filter-select {
+            padding: 0.8rem;
+            border: 2px solid #e9ecef;
+            border-radius: 10px;
+            font-size: 0.9rem;
+            outline: none;
+            background: white;
+            transition: all 0.3s ease;
+        }
+
+        .filter-select:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
 
         .category-filters {
@@ -392,22 +542,120 @@ function getCoverImagePath($cover_image) {
             gap: 1rem;
             justify-content: center;
             flex-wrap: wrap;
+            margin-top: 1rem;
         }
 
         .category-btn {
             background: #f8f9fa;
             color: #667eea;
             border: 2px solid #667eea;
-            padding: 0.5rem 1rem;
+            padding: 0.6rem 1.2rem;
             border-radius: 25px;
             text-decoration: none;
             transition: all 0.3s ease;
             font-size: 0.9rem;
+            position: relative;
+            overflow: hidden;
         }
 
-        .category-btn:hover, .category-btn.active {
+        .category-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            transition: left 0.3s ease;
+            z-index: -1;
+        }
+
+        .category-btn:hover::before,
+        .category-btn.active::before {
+            left: 0;
+        }
+
+        .category-btn:hover,
+        .category-btn.active {
+            color: white;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.3);
+        }
+
+        .results-header {
+            display: flex;
+            justify-content: between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            padding: 1rem 0;
+            border-bottom: 2px solid #f0f0f0;
+        }
+
+        .results-info {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .results-count {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .results-filters {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .active-filter {
             background: #667eea;
             color: white;
+            padding: 0.3rem 0.8rem;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .filter-remove {
+            background: none;
+            border: none;
+            color: white;
+            cursor: pointer;
+            padding: 0;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.3s ease;
+        }
+
+        .filter-remove:hover {
+            background: rgba(255,255,255,0.2);
+        }
+
+        .sort-controls {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .sort-select {
+            padding: 0.5rem 1rem;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            outline: none;
+            background: white;
+            transition: all 0.3s ease;
+        }
+
+        .sort-select:focus {
+            border-color: #667eea;
         }
 
         /* Main Content */
@@ -465,11 +713,36 @@ function getCoverImagePath($cover_image) {
             color: #333;
             transition: all 0.3s ease;
             box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .quick-action::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+            transition: left 0.3s ease;
+            z-index: 0;
+        }
+
+        .quick-action:hover::before {
+            left: 0;
         }
 
         .quick-action:hover {
             transform: translateY(-5px);
             box-shadow: 0 15px 30px rgba(0,0,0,0.15);
+        }
+
+        .quick-action i,
+        .quick-action h4,
+        .quick-action p {
+            position: relative;
+            z-index: 1;
         }
 
         .quick-action i {
@@ -503,10 +776,18 @@ function getCoverImagePath($cover_image) {
             transition: all 0.3s ease;
             position: relative;
             border: 1px solid #f0f0f0;
+            opacity: 1;
+            transform: scale(1);
+        }
+
+        .book-card.filtered-out {
+            opacity: 0;
+            transform: scale(0.8);
+            pointer-events: none;
         }
 
         .book-card:hover {
-            transform: translateY(-8px);
+            transform: translateY(-8px) scale(1.02);
             box-shadow: 0 20px 40px rgba(0,0,0,0.15);
         }
 
@@ -838,38 +1119,6 @@ function getCoverImagePath($cover_image) {
             box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
         }
 
-        /* Pagination */
-        .pagination {
-            display: flex;
-            justify-content: center;
-            gap: 0.5rem;
-            margin-top: 2rem;
-        }
-
-        .pagination a, .pagination span {
-            padding: 0.8rem 1rem;
-            border-radius: 8px;
-            text-decoration: none;
-            transition: all 0.3s ease;
-        }
-
-        .pagination a {
-            background: white;
-            color: #667eea;
-            border: 2px solid #667eea;
-        }
-
-        .pagination a:hover {
-            background: #667eea;
-            color: white;
-        }
-
-        .pagination .current {
-            background: #667eea;
-            color: white;
-            border: 2px solid #667eea;
-        }
-
         /* Notification */
         .notification {
             position: fixed;
@@ -943,19 +1192,48 @@ function getCoverImagePath($cover_image) {
         /* Empty State */
         .empty-state {
             text-align: center;
-            padding: 2rem;
+            padding: 3rem 2rem;
             color: #666;
         }
 
         .empty-state i {
-            font-size: 3rem;
+            font-size: 4rem;
             color: #ddd;
             margin-bottom: 1rem;
         }
 
         .empty-state h4 {
-            font-size: 1.2rem;
+            font-size: 1.4rem;
             margin-bottom: 0.5rem;
+            color: #333;
+        }
+
+        .empty-state p {
+            font-size: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .empty-state-suggestions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            justify-content: center;
+        }
+
+        .suggestion-chip {
+            background: #e3f2fd;
+            color: #1976d2;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: all 0.3s ease;
+        }
+
+        .suggestion-chip:hover {
+            background: #1976d2;
+            color: white;
+            transform: translateY(-2px);
         }
 
         /* Mobile Responsive */
@@ -996,6 +1274,25 @@ function getCoverImagePath($cover_image) {
 
             .modal-actions {
                 flex-direction: column;
+            }
+
+            .filter-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .search-suggestions {
+                margin: 0 1rem;
+            }
+
+            .results-header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 1rem;
+            }
+
+            .sort-controls {
+                width: 100%;
+                justify-content: space-between;
             }
         }
     </style>
@@ -1056,11 +1353,9 @@ function getCoverImagePath($cover_image) {
                 <span>ห้องสมุดดิจิทัล</span>
             </div>
             <ul class="nav-links">
-                <li><a href="dashboard.php">แดชบอร์ด</a></li>
                 <li><a href="#" class="active">หน้าแรก</a></li>
+                <li><a href="dashboard.php">แดชบอร์ด</a></li>
                 <li><a href="profile.php">โปรไฟล์</a></li>
-                <li><a href="history.php">ประวัติการยืม</a></li>
-                <li><a href="search.php">ค้นหาหนังสือ</a></li>
             </ul>
             <div class="user-menu">
                 <a href="../logout.php" class="btn-logout">
@@ -1109,29 +1404,107 @@ function getCoverImagePath($cover_image) {
         </div>
     </section>
 
-    <!-- Search Section -->
+    <!-- Enhanced Search Section -->
     <section class="search-section">
         <div class="search-container">
             <h2><i class="fas fa-search"></i> ค้นหาหนังสือ</h2>
             
-            <form class="search-form" method="GET" action="" id="searchForm">
-                <input type="text" name="search" class="search-input" id="searchInput"
-                       placeholder="ค้นหาหนังสือ ผู้เขียน หรือ ISBN..." 
-                       value="<?php echo htmlspecialchars($search); ?>"
-                       autocomplete="off">
-                <button type="submit" class="search-btn">
-                    <i class="fas fa-search"></i>
-                </button>
-            </form>
+            <div class="search-form-wrapper">
+                <div class="search-form" id="searchForm">
+                    <div class="search-input-wrapper">
+                        <input type="text" class="search-input" id="searchInput"
+                               placeholder="ค้นหาหนังสือ ผู้เขียน หรือ ISBN..." 
+                               autocomplete="off">
+                        <i class="fas fa-search search-input-icon"></i>
+                        <button type="button" class="search-clear-btn" id="searchClearBtn">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Search Suggestions -->
+                <div class="search-suggestions" id="searchSuggestions">
+                    <!-- Dynamic suggestions will be populated here -->
+                </div>
+            </div>
 
-            <div class="category-filters">
-                <a href="?" class="category-btn <?php echo $category_id == 0 ? 'active' : ''; ?>">
-                    ทั้งหมด
+            <!-- Advanced Filters -->
+            <div class="advanced-filters" id="advancedFilters">
+                <div class="filters-header">
+                    <button class="filters-toggle" id="filtersToggle">
+                        <i class="fas fa-filter"></i>
+                        <span>ตัวกรองขั้นสูง</span>
+                        <i class="fas fa-chevron-down"></i>
+                    </button>
+                </div>
+                
+                <div class="filters-content" id="filtersContent">
+                    <div class="filter-grid">
+                        <div class="filter-group">
+                            <label class="filter-label">
+                                <i class="fas fa-tag"></i> หมวดหมู่
+                            </label>
+                            <select class="filter-select" id="categoryFilter">
+                                <option value="">ทุกหมวดหมู่</option>
+                                <?php foreach ($categories as $category): ?>
+                                    <option value="<?php echo $category['category_id']; ?>">
+                                        <?php echo htmlspecialchars($category['category_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        
+                        <div class="filter-group">
+                            <label class="filter-label">
+                                <i class="fas fa-building"></i> สำนักพิมพ์
+                            </label>
+                            <select class="filter-select" id="publisherFilter">
+                                <option value="">ทุกสำนักพิมพ์</option>
+                                <?php foreach ($publishers as $publisher): ?>
+                                    <option value="<?php echo $publisher['publisher_id']; ?>">
+                                        <?php echo htmlspecialchars($publisher['publisher_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        
+                        <div class="filter-group">
+                            <label class="filter-label">
+                                <i class="fas fa-user-edit"></i> ผู้เขียน
+                            </label>
+                            <select class="filter-select" id="authorFilter">
+                                <option value="">ทุกผู้เขียน</option>
+                                <?php foreach ($authors as $author): ?>
+                                    <option value="<?php echo $author['author_id']; ?>">
+                                        <?php echo htmlspecialchars($author['first_name'] . ' ' . $author['last_name']); ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        
+                        <div class="filter-group">
+                            <label class="filter-label">
+                                <i class="fas fa-check-circle"></i> สถานะ
+                            </label>
+                            <select class="filter-select" id="statusFilter">
+                                <option value="">ทุกสถานะ</option>
+                                <option value="available">ว่าง</option>
+                                <option value="unavailable">ไม่ว่าง</option>
+                                <option value="reserved">ถูกจองแล้ว</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Quick Category Filters -->
+            <div class="category-filters" id="categoryFilters">
+                <a href="#" class="category-btn active" data-category="">
+                    <i class="fas fa-globe"></i> ทั้งหมด
                 </a>
-                <?php foreach ($categories as $category): ?>
-                    <a href="?category=<?php echo $category['category_id']; ?><?php echo $search ? '&search=' . urlencode($search) : ''; ?>" 
-                       class="category-btn <?php echo $category_id == $category['category_id'] ? 'active' : ''; ?>">
-                        <?php echo htmlspecialchars($category['category_name']); ?>
+                <?php foreach (array_slice($categories, 0, 100) as $category): ?>
+                    <a href="#" class="category-btn" data-category="<?php echo $category['category_id']; ?>">
+                        <i class="fas fa-tag"></i> <?php echo htmlspecialchars($category['category_name']); ?>
                     </a>
                 <?php endforeach; ?>
             </div>
@@ -1147,16 +1520,6 @@ function getCoverImagePath($cover_image) {
                 <h4>แดชบอร์ด</h4>
                 <p>ดูสถานะการยืมและข้อมูลส่วนตัว</p>
             </a>
-            <a href="search.php" class="quick-action">
-                <i class="fas fa-search-plus"></i>
-                <h4>ค้นหาขั้นสูง</h4>
-                <p>ค้นหาหนังสือด้วยตัวกรองหลากหลาย</p>
-            </a>
-            <a href="history.php" class="quick-action">
-                <i class="fas fa-history"></i>
-                <h4>ประวัติการยืม</h4>
-                <p>ดูประวัติการยืมและคืนหนังสือ</p>
-            </a>
             <a href="profile.php" class="quick-action">
                 <i class="fas fa-user-cog"></i>
                 <h4>แก้ไขโปรไฟล์</h4>
@@ -1170,418 +1533,1202 @@ function getCoverImagePath($cover_image) {
             <div class="section">
                 <div class="section-header">
                     <i class="fas fa-book"></i>
-                    <h3>
-                        <?php 
-                        if (!empty($search) || $category_id > 0) {
-                            echo "ผลการค้นหา (" . number_format($total_books) . " เล่ม)";
-                        } else {
-                            echo "หนังสือทั้งหมด";
-                        }
-                        ?>
-                    </h3>
+                    <h3 id="sectionTitle">หนังสือแนะนำ</h3>
                 </div>
 
-                <?php if (empty($books)): ?>
-                    <div class="empty-state">
-                        <i class="fas fa-search"></i>
-                        <h4>ไม่พบหนังสือที่ค้นหา</h4>
-                        <p>ลองใช้คำค้นหาอื่น หรือเลือกหมวดหมู่ที่แตกต่างกัน</p>
+                <!-- Results Header -->
+                <div class="results-header" id="resultsHeader" style="display: none;">
+                    <div class="results-info">
+                        <div class="results-count" id="resultsCount">
+                            พบ 0 เล่ม
+                        </div>
+                        <div class="results-filters" id="activeFilters">
+                            <!-- Active filters will be shown here -->
+                        </div>
                     </div>
-                <?php else: ?>
-                    <div class="books-grid">
-                        <?php 
-                        $display_books = !empty($search) || $category_id > 0 ? $books : $recommended_books;
-                        foreach ($display_books as $book): 
-                            // Check if user already borrowed this book
-                            $stmt = $pdo->prepare("SELECT COUNT(*) FROM borrowing WHERE user_id = ? AND book_id = ? AND status IN ('borrowed', 'overdue')");
-                            $stmt->execute([$user_id, $book['book_id']]);
-                            $already_borrowed = $stmt->fetchColumn() > 0;
+                    <div class="sort-controls">
+                        <label for="sortSelect">เรียงตาม:</label>
+                        <select class="sort-select" id="sortSelect">
+                            <option value="relevance">ความเกี่ยวข้อง</option>
+                            <option value="title">ชื่อหนังสือ A-Z</option>
+                            <option value="title_desc">ชื่อหนังสือ Z-A</option>
+                            <option value="author">ผู้เขียน A-Z</option>
+                            <option value="category">หมวดหมู่</option>
+                            <option value="newest">ใหม่ล่าสุด</option>
+                            <option value="available">ว่างก่อน</option>
+                        </select>
+                    </div>
+                </div>
 
-                            // Check if user already reserved this book
-                            $stmt = $pdo->prepare("SELECT COUNT(*) FROM reservations WHERE user_id = ? AND book_id = ? AND status = 'active'");
-                            $stmt->execute([$user_id, $book['book_id']]);
-                            $already_reserved = $stmt->fetchColumn() > 0;
+                <div class="books-grid" id="booksGrid">
+                    <?php foreach ($recommended_books as $book): 
+                        // Check if user already borrowed this book
+                        $stmt = $pdo->prepare("SELECT COUNT(*) FROM borrowing WHERE user_id = ? AND book_id = ? AND status IN ('borrowed', 'overdue')");
+                        $stmt->execute([$user_id, $book['book_id']]);
+                        $already_borrowed = $stmt->fetchColumn() > 0;
+                        
+                        // ใช้ข้อมูลที่ดึงมาจาก query แล้ว
+                        $already_reserved = $book['user_reserved'] > 0;
+                        $book_reserved_by_others = $book['reserved_count'] > 0 && !$already_reserved;
+                      
+                        // Check if cover image exists
+                        $has_cover_image = checkCoverImageExists($book['cover_image']);
+                    ?>
+                        <div class="book-card" 
+                            data-book-id="<?php echo $book['book_id']; ?>"
+                            data-title="<?php echo strtolower(htmlspecialchars($book['title'])); ?>"
+                            data-author="<?php echo strtolower(htmlspecialchars($book['authors'] ?: '')); ?>"
+                            data-category="<?php echo $book['category_id'] ?: ''; ?>"
+                            data-category-name="<?php echo strtolower(htmlspecialchars($book['category_name'] ?: '')); ?>"
+                            data-publisher="<?php echo $book['publisher_id'] ?: ''; ?>"
+                            data-isbn="<?php echo strtolower(htmlspecialchars($book['isbn'] ?: '')); ?>"
+                            data-status="<?php 
+                                if ($book['status'] === 'reserved') {
+                                    echo 'reserved';
+                                } else {
+                                    echo $book['available_copies'] > 0 ? 'available' : 'unavailable';
+                                }
+                            ?>">
 
-                            // Check if book is reserved by someone else
-                            $stmt = $pdo->prepare("SELECT COUNT(*) FROM reservations WHERE book_id = ? AND status = 'active'");
-                            $stmt->execute([$book['book_id']]);
-                            $book_reserved_by_others = $stmt->fetchColumn() > 0 && !$already_reserved;
                             
-                            // Get cover image path
-                            $cover_image_path = getCoverImagePath($book['cover_image']);
-                        ?>
-                            <div class="book-card" data-book-id="<?php echo $book['book_id']; ?>">
-                                <div class="book-image">
-                                    <div class="book-availability">
-                                        <?php echo $book['available_copies']; ?>/<?php echo $book['total_copies']; ?> เล่ม
+                            <div class="book-image">
+                                <div class="book-availability">
+                                    <?php echo $book['available_copies']; ?>/<?php echo $book['total_copies']; ?> เล่ม
+                                </div>
+                                <?php if ($has_cover_image): ?>
+                                    <img src="../<?php echo htmlspecialchars($book['cover_image']); ?>" 
+                                         alt="<?php echo htmlspecialchars($book['title']); ?>"
+                                         onerror="handleImageError(this);">
+                                    <div class="book-fallback-icon">
+                                        <i class="fas fa-book"></i>
                                     </div>
-                                    <?php if ($cover_image_path): ?>
-                                        <img src="<?php echo htmlspecialchars($cover_image_path); ?>" 
-                                             alt="<?php echo htmlspecialchars($book['title']); ?>"
-                                             onerror="handleImageError(this);">
-                                        <div class="book-fallback-icon">
-                                            <i class="fas fa-book"></i>
-                                        </div>
-                                    <?php else: ?>
-                                        <div class="book-fallback-icon" style="display: flex;">
-                                            <i class="fas fa-book"></i>
-                                        </div>
-                                    <?php endif; ?>
+                                <?php else: ?>
+                                    <div class="book-fallback-icon" style="display: flex;">
+                                        <i class="fas fa-book"></i>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                            
+                            <div class="book-info">
+                                <h3 class="book-title" title="<?php echo htmlspecialchars($book['title']); ?>">
+                                    <?php echo htmlspecialchars($book['title']); ?>
+                                </h3>
+                                
+                                <div class="book-author">
+                                    <i class="fas fa-user"></i>
+                                    <?php echo htmlspecialchars($book['authors'] ?: 'ไม่ระบุผู้เขียน'); ?>
+                                </div>
+
+                                <?php if (!empty($book['isbn'])): ?>
+                                <div class="book-isbn">
+                                    <i class="fas fa-barcode"></i>
+                                    <?php echo htmlspecialchars($book['isbn']); ?>
+                                </div>
+                                <?php endif; ?>
+                                
+                                <div class="book-category">
+                                    <?php echo htmlspecialchars($book['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?>
                                 </div>
                                 
-                                <div class="book-info">
-                                    <h3 class="book-title" title="<?php echo htmlspecialchars($book['title']); ?>">
-                                        <?php echo htmlspecialchars($book['title']); ?>
-                                    </h3>
-                                    
-                                    <div class="book-author">
-                                        <i class="fas fa-user"></i>
-                                        <?php echo htmlspecialchars($book['authors'] ?: 'ไม่ระบุผู้เขียน'); ?>
-                                    </div>
-
-                                    <?php if (!empty($book['isbn'])): ?>
-                                    <div class="book-isbn">
-                                        <i class="fas fa-barcode"></i>
-                                        <?php echo htmlspecialchars($book['isbn']); ?>
-                                    </div>
+                                <div class="book-actions">
+                                    <?php if ($already_borrowed): ?>
+                                        <button class="btn-reserve reserved" disabled>
+                                            <i class="fas fa-check"></i>
+                                            ยืมอยู่
+                                        </button>
+                                    <?php elseif ($already_reserved): ?>
+                                        <button class="btn-reserve reserved" disabled>
+                                            <i class="fas fa-bookmark"></i>
+                                            จองแล้ว
+                                        </button>
+                                    <?php elseif ($user_borrowed_count >= $max_borrow_books): ?>
+                                        <button class="btn-reserve" disabled title="ยืมครบจำนวนสูงสุดแล้ว">
+                                            <i class="fas fa-ban"></i>
+                                            ยืมครบแล้ว
+                                        </button>
+                                    <?php elseif ($book_reserved_by_others): ?>
+                                        <button class="btn-reserve" disabled title="หนังสือถูกจองแล้ว">
+                                            <i class="fas fa-bookmark"></i>
+                                            ถูกจองแล้ว
+                                        </button>
+                                    <?php elseif ($book['available_copies'] <= 0): ?>
+                                        <button class="btn-reserve" disabled>
+                                            <i class="fas fa-times"></i>
+                                            ไม่ว่าง
+                                        </button>
+                                    <?php else: ?>
+                                        <button class="btn-reserve" onclick="showReserveModal(<?php echo $book['book_id']; ?>, '<?php echo addslashes($book['title']); ?>', '<?php echo addslashes($book['authors'] ?: 'ไม่ระบุผู้เขียน'); ?>', '<?php echo addslashes($book['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?>', '<?php echo addslashes($book['isbn'] ?: 'ไม่ระบุ ISBN'); ?>')">
+                                            <i class="fas fa-bookmark"></i>
+                                            จองหนังสือ
+                                        </button>
                                     <?php endif; ?>
-                                    
-                                    <div class="book-category">
-                                        <?php echo htmlspecialchars($book['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?>
-                                    </div>
-                                    
-                                    <div class="book-actions">
-                                        <?php if ($already_borrowed): ?>
-                                            <button class="btn-reserve reserved" disabled>
-                                                <i class="fas fa-check"></i>
-                                                ยืมอยู่
-                                            </button>
-                                        <?php elseif ($already_reserved): ?>
-                                            <button class="btn-reserve reserved" disabled>
-                                                <i class="fas fa-bookmark"></i>
-                                                จองแล้ว
-                                            </button>
-                                        <?php elseif ($user_borrowed_count >= $max_borrow_books): ?>
-                                            <button class="btn-reserve" disabled title="ยืมครบจำนวนสูงสุดแล้ว">
-                                                <i class="fas fa-ban"></i>
-                                                ยืมครบแล้ว
-                                            </button>
-                                        <?php elseif ($book_reserved_by_others): ?>
-                                            <button class="btn-reserve" disabled title="หนังสือถูกจองแล้ว">
-                                                <i class="fas fa-bookmark"></i>
-                                                ถูกจองแล้ว
-                                            </button>
-                                        <?php elseif ($book['available_copies'] <= 0): ?>
-                                            <button class="btn-reserve" disabled>
-                                                <i class="fas fa-times"></i>
-                                                ไม่ว่าง
-                                            </button>
-                                        <?php else: ?>
-                                            <button class="btn-reserve" onclick="showReserveModal(<?php echo $book['book_id']; ?>, '<?php echo addslashes($book['title']); ?>', '<?php echo addslashes($book['authors'] ?: 'ไม่ระบุผู้เขียน'); ?>', '<?php echo addslashes($book['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?>', '<?php echo addslashes($book['isbn'] ?: 'ไม่ระบุ ISBN'); ?>')">
-                                                <i class="fas fa-bookmark"></i>
-                                                จองหนังสือ
-                                            </button>
-                                        <?php endif; ?>
-                                    </div>
                                 </div>
                             </div>
-                        <?php endforeach; ?>
-                    </div>
-
-                    <!-- Pagination (only show if searching) -->
-                    <?php if ((!empty($search) || $category_id > 0) && $total_pages > 1): ?>
-                        <div class="pagination">
-                            <?php
-                            $query_params = [];
-                            if (!empty($search)) $query_params['search'] = $search;
-                            if ($category_id > 0) $query_params['category'] = $category_id;
-                            
-                            // Previous page
-                            if ($page > 1) {
-                                $query_params['page'] = $page - 1;
-                                $url = '?' . http_build_query($query_params);
-                                echo '<a href="' . $url . '"><i class="fas fa-chevron-left"></i></a>';
-                            }
-                            
-                            // Page numbers
-                            $start_page = max(1, $page - 2);
-                            $end_page = min($total_pages, $page + 2);
-                            
-                            for ($i = $start_page; $i <= $end_page; $i++):
-                                $query_params['page'] = $i;
-                                $url = '?' . http_build_query($query_params);
-                            ?>
-                                <?php if ($i == $page): ?>
-                                    <span class="current"><?php echo $i; ?></span>
-                                <?php else: ?>
-                                    <a href="<?php echo $url; ?>"><?php echo $i; ?></a>
-                                <?php endif; ?>
-                            <?php endfor; ?>
-                            
-                            <?php
-                            // Next page
-                            if ($page < $total_pages) {
-                                $query_params['page'] = $page + 1;
-                                $url = '?' . http_build_query($query_params);
-                                echo '<a href="' . $url . '"><i class="fas fa-chevron-right"></i></a>';
-                            }
-                            ?>
                         </div>
-                    <?php endif; ?>
-                <?php endif; ?>
+                    <?php endforeach; ?>
+                </div>
+
+                <!-- Empty State -->
+                <div class="empty-state" id="emptyState" style="display: none;">
+                    <i class="fas fa-search"></i>
+                    <h4>ไม่พบหนังสือที่ค้นหา</h4>
+                    <p>ลองปรับเปลี่ยนคำค้นหาหรือตัวกรอง</p>
+                    <div class="empty-state-suggestions">
+                        <a href="#" class="suggestion-chip" onclick="clearAllFilters()">ล้างตัวกรอง</a>
+                        <a href="#" class="suggestion-chip" onclick="showPopularBooks()">หนังสือยอดนิยม</a>
+                        <a href="#" class="suggestion-chip" onclick="showRecentBooks()">หนังสือใหม่</a>
+                    </div
+                </div>
             </div>
         </div>
-    </div>
-
+    </div>  
+    
+             
+          
     <script>
         // ========================
-        // CORE SYSTEM VARIABLES
+        // ENHANCED SEARCH SYSTEM
         // ========================
-        let isProcessing = false;
-        let currentBookId = null;
+        let searchTimeout;
+        let isSearching = false;
+        let allBooks = <?php echo json_encode($recommended_books); ?>;
+        let filteredBooks = [...allBooks];
+        let activeFilters = {};
+
+        // Initialize search functionality
+        document.addEventListener('DOMContentLoaded', function() {
+            initializeSearch();
+            initializeFilters();
+            initializeCategories();
+            bindEventListeners();
+        });
+
+        function initializeSearch() {
+            const searchInput = document.getElementById('searchInput');
+            const searchClearBtn = document.getElementById('searchClearBtn');
+            const searchForm = document.getElementById('searchForm');
+            const searchSuggestions = document.getElementById('searchSuggestions');
+
+            // Search input events
+            searchInput.addEventListener('input', function() {
+                const query = this.value.trim();
+                
+                // Show/hide clear button
+                if (query.length > 0) {
+                    searchClearBtn.classList.add('visible');
+                } else {
+                    searchClearBtn.classList.remove('visible');
+                    hideSuggestions();
+                }
+
+                // Debounced search
+                clearTimeout(searchTimeout);
+                searchTimeout = setTimeout(() => {
+                    if (query.length >= 2) {
+                        performSearch(query);
+                        showSuggestions(query);
+                    } else if (query.length === 0) {
+                        clearSearch();
+                    }
+                }, 300);
+            });
+
+            // Focus and blur events
+            searchInput.addEventListener('focus', function() {
+                searchForm.classList.add('focused');
+                const query = this.value.trim();
+                if (query.length >= 2) {
+                    showSuggestions(query);
+                }
+            });
+
+            searchInput.addEventListener('blur', function() {
+                setTimeout(() => {
+                    searchForm.classList.remove('focused');
+                    hideSuggestions();
+                }, 200);
+            });
+
+            // Clear button
+            searchClearBtn.addEventListener('click', function() {
+                searchInput.value = '';
+                searchInput.focus();
+                clearSearch();
+                this.classList.remove('visible');
+                hideSuggestions();
+            });
+
+            // Prevent form submission
+            searchInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const query = this.value.trim();
+                    if (query) {
+                        performSearch(query);
+                    }
+                    hideSuggestions();
+                }
+            });
+        }
+
+        function performSearch(query) {
+            if (isSearching) return;
+            isSearching = true;
+
+            // Update UI
+            document.getElementById('sectionTitle').textContent = `ผลการค้นหา "${query}"`;
+            document.getElementById('resultsHeader').style.display = 'flex';
+
+            // Filter books based on search query
+            const searchResults = allBooks.filter(book => {
+                const searchableText = [
+                    book.title || '',
+                    book.authors || '',
+                    book.category_name || '',
+                    book.publisher_name || '',
+                    book.isbn || ''
+                ].join(' ').toLowerCase();
+
+                return searchableText.includes(query.toLowerCase());
+            });
+
+            filteredBooks = searchResults;
+            // เพิ่มบรรทัดนี้เพื่อให้แสดงเฉพาะหนังสือที่ค้นหาได้
+            displayBooks(filteredBooks);
+            updateResultsCount();
+
+            isSearching = false;
+        }
+
+        function clearSearch() {
+            document.getElementById('sectionTitle').textContent = 'หนังสือแนะนำ';
+            document.getElementById('resultsHeader').style.display = 'none';
+            
+            filteredBooks = [...allBooks];
+            // แสดงหนังสือทั้งหมดกลับมา
+            const allCards = document.querySelectorAll('.book-card');
+            allCards.forEach(card => {
+                card.style.display = 'block';
+            });
+            document.getElementById('emptyState').style.display = 'none';
+        }
+
+        function showSuggestions(query) {
+            const suggestions = generateSuggestions(query);
+            const suggestionsContainer = document.getElementById('searchSuggestions');
+            
+            if (suggestions.length === 0) {
+                hideSuggestions();
+                return;
+            }
+
+            suggestionsContainer.innerHTML = suggestions.map(suggestion => `
+                <div class="suggestion-item" onclick="selectSuggestion('${suggestion.text}', '${suggestion.type}')">
+                    <i class="fas ${suggestion.icon} suggestion-icon"></i>
+                    <span class="suggestion-text">${suggestion.text}</span>
+                    <span class="suggestion-type">${suggestion.type}</span>
+                </div>
+            `).join('');
+
+            suggestionsContainer.classList.add('visible');
+        }
+
+        function hideSuggestions() {
+            const suggestionsContainer = document.getElementById('searchSuggestions');
+            suggestionsContainer.classList.remove('visible');
+        }
+
+        function generateSuggestions(query) {
+            const suggestions = [];
+            const queryLower = query.toLowerCase();
+            const maxSuggestions = 6;
+
+            // Book titles
+            const titleMatches = allBooks.filter(book => 
+                book.title && book.title.toLowerCase().includes(queryLower)
+            ).slice(0, 3);
+
+            titleMatches.forEach(book => {
+                suggestions.push({
+                    text: book.title,
+                    type: 'หนังสือ',
+                    icon: 'fa-book'
+                });
+            });
+
+            // Authors
+            const authors = [...new Set(allBooks.map(book => book.authors).filter(Boolean))];
+            const authorMatches = authors.filter(author => 
+                author.toLowerCase().includes(queryLower)
+            ).slice(0, 2);
+
+            authorMatches.forEach(author => {
+                suggestions.push({
+                    text: author,
+                    type: 'ผู้เขียน',
+                    icon: 'fa-user'
+                });
+            });
+
+            // Categories
+            const categories = [...new Set(allBooks.map(book => book.category_name).filter(Boolean))];
+            const categoryMatches = categories.filter(category => 
+                category.toLowerCase().includes(queryLower)
+            ).slice(0, 2);
+
+            categoryMatches.forEach(category => {
+                suggestions.push({
+                    text: category,
+                    type: 'หมวดหมู่',
+                    icon: 'fa-tag'
+                });
+            });
+
+            return suggestions.slice(0, maxSuggestions);
+        }
+
+        function selectSuggestion(text, type) {
+            const searchInput = document.getElementById('searchInput');
+            searchInput.value = text;
+            performSearch(text);
+            hideSuggestions();
+        }
 
         // ========================
-        // IMAGE ERROR HANDLING - แก้ไขส่วนนี้
+        // FILTER SYSTEM
         // ========================
-        function handleImageError(imgElement) {
-            console.log('Image failed to load:', imgElement.src);
-            // Hide the broken image
-            imgElement.style.display = 'none';
+        function initializeFilters() {
+            const filtersToggle = document.getElementById('filtersToggle');
+            const filtersContent = document.getElementById('filtersContent');
+            const advancedFilters = document.getElementById('advancedFilters');
+
+            filtersToggle.addEventListener('click', function() {
+                const isExpanded = filtersContent.classList.contains('expanded');
+                
+                if (isExpanded) {
+                    filtersContent.classList.remove('expanded');
+                    advancedFilters.classList.remove('expanded');
+                    filtersToggle.classList.remove('expanded');
+                } else {
+                    filtersContent.classList.add('expanded');
+                    advancedFilters.classList.add('expanded');
+                    filtersToggle.classList.add('expanded');
+                }
+            });
+
+            // Filter change events
+            ['categoryFilter', 'publisherFilter', 'authorFilter', 'statusFilter'].forEach(filterId => {
+                const filterElement = document.getElementById(filterId);
+                if (filterElement) {
+                    filterElement.addEventListener('change', function() {
+                        updateActiveFilter(filterId, this.value, this.options[this.selectedIndex].text);
+                        applyFilters();
+                    });
+                }
+            });
+
+            // Sort change event
+            const sortSelect = document.getElementById('sortSelect');
+            if (sortSelect) {
+                sortSelect.addEventListener('change', function() {
+                    sortBooks(this.value);
+                });
+            }
+        }
+
+        function updateActiveFilter(filterId, value, text) {
+            const filterKey = filterId.replace('Filter', '');
             
-            // Show fallback icon
-            const fallbackIcon = imgElement.parentElement.querySelector('.book-fallback-icon');
-            if (fallbackIcon) {
-                fallbackIcon.style.display = 'flex';
+            if (value) {
+                activeFilters[filterKey] = { value, text };
+            } else {
+                delete activeFilters[filterKey];
+            }
+            
+            displayActiveFilters();
+        }
+
+        function displayActiveFilters() {
+            const activeFiltersContainer = document.getElementById('activeFilters');
+            
+            const filterChips = Object.entries(activeFilters).map(([key, filter]) => `
+                <div class="active-filter">
+                    <span>${filter.text}</span>
+                    <button class="filter-remove" onclick="removeActiveFilter('${key}')">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+            `).join('');
+            
+            activeFiltersContainer.innerHTML = filterChips;
+        }
+
+        function removeActiveFilter(filterKey) {
+            delete activeFilters[filterKey];
+            
+            // Reset corresponding filter select
+            const filterElement = document.getElementById(filterKey + 'Filter');
+            if (filterElement) {
+                filterElement.value = '';
+            }
+            
+            displayActiveFilters();
+            applyFilters();
+        }
+
+        function applyFilters() {
+            applyActiveFilters();
+            displayBooks(filteredBooks);
+            updateResultsCount();
+        }
+
+        function applyActiveFilters() {
+            filteredBooks = allBooks.filter(book => {
+                // Apply active filters
+                for (const [filterKey, filter] of Object.entries(activeFilters)) {
+                    switch (filterKey) {
+                        case 'category':
+                            if (book.category_id != filter.value) return false;
+                            break;
+                        case 'publisher':
+                            if (book.publisher_id != filter.value) return false;
+                            break;
+                        case 'author':
+                            // This would need to be implemented based on book-author relationships
+                            break;
+                        case 'status':
+                            const isAvailable = book.available_copies > 0;
+                            if (filter.value === 'available' && !isAvailable) return false;
+                            if (filter.value === 'unavailable' && isAvailable) return false;
+                            break;
+                        case 'status':
+                            const bookStatus = book.status;
+                            const bookAvailable = book.available_copies > 0 && book.status !== 'reserved';
+                            const bookReserved = book.status === 'reserved' || book.reserved_count > 0;
+                            
+                            if (filter.value === 'available' && !bookAvailable) return false;
+                            if (filter.value === 'unavailable' && bookAvailable) return false;
+                            if (filter.value === 'reserved' && !bookReserved) return false;
+                            break;
+                    }
+                }
+                
+                return true;
+            });
+        }
+
+        function clearAllFilters() {
+            activeFilters = {};
+            
+            // Reset all filter selects
+            ['categoryFilter', 'publisherFilter', 'authorFilter', 'statusFilter'].forEach(filterId => {
+                const filterElement = document.getElementById(filterId);
+                if (filterElement) filterElement.value = '';
+            });
+            
+            displayActiveFilters();
+            
+            // Clear search
+            const searchInput = document.getElementById('searchInput');
+            if (searchInput) {
+                searchInput.value = '';
+                document.getElementById('searchClearBtn').classList.remove('visible');
+            }
+            
+            // Reset to default view
+            clearSearch();
+        }
+
+        // ========================
+        // CATEGORY SYSTEM
+        // ========================
+        function initializeCategories() {
+            const categoryBtns = document.querySelectorAll('.category-btn');
+            
+            categoryBtns.forEach(btn => {
+                btn.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    
+                    // Update active state
+                    categoryBtns.forEach(b => b.classList.remove('active'));
+                    this.classList.add('active');
+                    
+                    // Apply category filter
+                    const categoryId = this.dataset.category;
+                    applyCategoryFilter(categoryId);
+                });
+            });
+        }
+
+        function applyCategoryFilter(categoryId) {
+            if (categoryId) {
+                // Set category filter
+                const categoryFilter = document.getElementById('categoryFilter');
+                if (categoryFilter) {
+                    categoryFilter.value = categoryId;
+                    const selectedText = categoryFilter.options[categoryFilter.selectedIndex].text;
+                    updateActiveFilter('categoryFilter', categoryId, selectedText);
+                }
+            } else {
+                // Clear category filter
+                delete activeFilters.category;
+                const categoryFilter = document.getElementById('categoryFilter');
+                if (categoryFilter) categoryFilter.value = '';
+            }
+            
+            displayActiveFilters();
+            applyFilters();
+            
+            // Update section title
+            const categoryName = categoryId ? 
+                document.querySelector(`[data-category="${categoryId}"]`).textContent.replace(/.*\s/, '') : 
+                'ทั้งหมด';
+            
+            document.getElementById('sectionTitle').textContent = 
+                categoryId ? `หมวดหมู่: ${categoryName}` : 'หนังสือแนะนำ';
+            
+            // Show/hide results header
+            const resultsHeader = document.getElementById('resultsHeader');
+            resultsHeader.style.display = categoryId ? 'flex' : 'none';
+        }
+
+        // ========================
+        // BOOK DISPLAY SYSTEM
+        // ========================
+        function displayBooks(books) {
+            const booksGrid = document.getElementById('booksGrid');
+            const emptyState = document.getElementById('emptyState');
+            const allCards = document.querySelectorAll('.book-card');
+            
+            if (books.length === 0) {
+                // ซ่อนการ์ดทั้งหมด
+                allCards.forEach(card => {
+                    card.style.display = 'none';
+                });
+                emptyState.style.display = 'block';
+                return;
+            }
+            
+            emptyState.style.display = 'none';
+            
+            // ซ่อนการ์ดทั้งหมดก่อน
+            allCards.forEach(card => {
+                card.style.display = 'none';
+            });
+            
+            // แสดงเฉพาะการ์ดที่ตรงกับผลการค้นหา
+            books.forEach(book => {
+                const card = document.querySelector(`[data-book-id="${book.book_id}"]`);
+                if (card) {
+                    card.style.display = 'block';
+                }
+            });
+        }
+
+
+        function updateResultsCount() {
+            const resultsCount = document.getElementById('resultsCount');
+            if (resultsCount) {
+                resultsCount.textContent = `พบ ${filteredBooks.length.toLocaleString()} เล่ม`;
+            }
+        }
+
+        function sortBooks(sortBy) {
+            const sortedBooks = [...filteredBooks];
+            
+            switch (sortBy) {
+                case 'title':
+                    sortedBooks.sort((a, b) => a.title.localeCompare(b.title, 'th'));
+                    break;
+                case 'title_desc':
+                    sortedBooks.sort((a, b) => b.title.localeCompare(a.title, 'th'));
+                    break;
+                case 'author':
+                    sortedBooks.sort((a, b) => (a.authors || '').localeCompare(b.authors || '', 'th'));
+                    break;
+                case 'category':
+                    sortedBooks.sort((a, b) => (a.category_name || '').localeCompare(b.category_name || '', 'th'));
+                    break;
+                case 'available':
+                    sortedBooks.sort((a, b) => b.available_copies - a.available_copies);
+                    break;
+                case 'newest':
+                    sortedBooks.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+                    break;
+                case 'relevance':
+                default:
+                    // Keep current order for relevance
+                    break;
+            }
+            
+            filteredBooks = sortedBooks;
+            displayBooks(filteredBooks);
+        }
+
+        // ========================
+        // QUICK ACTION FUNCTIONS
+        // ========================
+        function showPopularBooks() {
+            clearAllFilters();
+            // This would typically load popular books from server
+            document.getElementById('sectionTitle').textContent = 'หนังสือยอดนิยม';
+        }
+
+        function showRecentBooks() {
+            clearAllFilters();
+            sortBooks('newest');
+            document.getElementById('sectionTitle').textContent = 'หนังสือใหม่ล่าสุด';
+        }
+
+        // ========================
+        // EVENT LISTENERS
+        // ========================
+        function bindEventListeners() {
+            // Global keyboard shortcuts
+            document.addEventListener('keydown', function(e) {
+                // Ctrl/Cmd + K to focus search
+                if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+                    e.preventDefault();
+                    const searchInput = document.getElementById('searchInput');
+                    if (searchInput) {
+                        searchInput.focus();
+                        searchInput.select();
+                    }
+                }
+                
+                // Escape to clear search and filters
+                if (e.key === 'Escape') {
+                    const searchInput = document.getElementById('searchInput');
+                    if (searchInput === document.activeElement) {
+                        searchInput.blur();
+                    } else {
+                        clearAllFilters();
+                    }
+                }
+            });
+
+            // Smooth scroll for anchor links
+            document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+                anchor.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    const target = document.querySelector(this.getAttribute('href'));
+                    if (target) {
+                        target.scrollIntoView({
+                            behavior: 'smooth',
+                            block: 'start'
+                        });
+                    }
+                });
+            });
+
+            // Enhanced scroll effects
+            let lastScrollTop = 0;
+            window.addEventListener('scroll', function() {
+                const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+                const header = document.querySelector('.header');
+                
+                if (scrollTop > lastScrollTop && scrollTop > 100) {
+                    // Scrolling down
+                    header.style.transform = 'translateY(-100%)';
+                } else {
+                    // Scrolling up
+                    header.style.transform = 'translateY(0)';
+                }
+                
+                lastScrollTop = scrollTop;
+            });
+
+            console.log('🎉 Enhanced Library System Initialized Successfully!');
+            console.log('🔍 Advanced search and filtering system ready');
+            console.log('⌨️ Keyboard shortcuts: Ctrl+K (search), Escape (clear)');
+        }
+
+        // ========================
+        // UTILITY FUNCTIONS
+        // ========================
+        function debounce(func, wait) {
+            let timeout;
+            return function executedFunction(...args) {
+                const later = () => {
+                    clearTimeout(timeout);
+                    func(...args);
+                };
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
+            };
+        }
+
+        function throttle(func, limit) {
+            let inThrottle;
+            return function() {
+                const args = arguments;
+                const context = this;
+                if (!inThrottle) {
+                    func.apply(context, args);
+                    inThrottle = true;
+                    setTimeout(() => inThrottle = false, limit);
+                }
+            }
+        }
+
+        // ========================
+        // ERROR HANDLING
+        // ========================
+        window.addEventListener('error', function(e) {
+            console.error('JavaScript Error:', e.error);
+            showNotification('เกิดข้อผิดพลาดในระบบ กรุณาลองรีเฟรชหน้า', 'error');
+        });
+
+        window.addEventListener('unhandledrejection', function(e) {
+            console.error('Unhandled Promise Rejection:', e.reason);
+            showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่อีกครั้ง', 'error');
+        });
+
+        // ========================
+        // MODAL MANAGEMENT FUNCTIONS
+        // ========================
+
+        let currentBookId = null;
+
+        /**
+         * แสดง Modal สำหรับการจองหนังสือ
+         */
+        function showReserveModal(bookId, title, author, category, isbn) {
+            currentBookId = bookId;
+            
+            // อัพเดทข้อมูลหนังสือใน Modal
+            document.getElementById('modal-book-title').textContent = title;
+            document.getElementById('modal-book-author').innerHTML = `<i class="fas fa-user"></i> ${author}`;
+            document.getElementById('modal-book-category').innerHTML = `<i class="fas fa-tag"></i> ${category}`;
+            document.getElementById('modal-book-isbn').innerHTML = `<i class="fas fa-barcode"></i> ${isbn}`;
+            
+            // แสดง Modal
+            const modal = document.getElementById('reserveModal');
+            modal.style.display = 'block';
+            
+            // เพิ่ม animation effect
+            setTimeout(() => {
+                modal.style.opacity = '1';
+            }, 10);
+            
+            // ป้องกันการ scroll ของ body
+            document.body.style.overflow = 'hidden';
+        }
+
+        /**
+         * ปิด Modal
+         */
+        function closeModal(modalId) {
+            const modal = document.getElementById(modalId);
+            if (modal) {
+                modal.style.display = 'none';
+                document.body.style.overflow = 'auto';
+                currentBookId = null;
+            }
+        }
+
+        /**
+         * ปิด Modal เมื่อคลิกนอกพื้นที่ Modal
+         */
+        window.onclick = function(event) {
+            const modal = document.getElementById('reserveModal');
+            if (event.target === modal) {
+                closeModal('reserveModal');
+            }
+        }
+
+        // ปิด Modal ด้วยปุ่ม ESC
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                const modal = document.getElementById('reserveModal');
+                if (modal && modal.style.display === 'block') {
+                    closeModal('reserveModal');
+                }
+            }
+        });
+
+        // ========================
+        // BOOK RESERVATION FUNCTIONS
+        // ========================
+
+        /**
+         * ยืนยันการจองหนังสือ
+         */
+        async function confirmReserve() {
+            if (!currentBookId) {
+                showNotification('เกิดข้อผิดพลาด: ไม่พบข้อมูลหนังสือ', 'error');
+                return;
+            }
+
+            showLoading();
+            
+            const confirmBtn = document.getElementById('confirm-reserve-btn');
+            confirmBtn.disabled = true;
+            confirmBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> กำลังประมวลผล...';
+
+            try {
+                const response = await fetch('reserve_book.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        book_id: currentBookId,
+                        action: 'reserve'
+                    })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showNotification('จองหนังสือสำเร็จ! รอการอนุมัติจากแอดมิน', 'success');
+                    
+                    // อัพเดท UI ทันที
+                    updateBookCardAfterReserve(currentBookId);
+                    updateUserStats();
+                    
+                    // รีเฟรชข้อมูลหนังสือเพื่อให้แน่ใจว่าข้อมูลล่าสุด
+                    await refreshBookDisplay();
+                    
+                    closeModal('reserveModal');
+                    
+                } else {
+                    throw new Error(result.message || 'เกิดข้อผิดพลาดในการจองหนังสือ');
+                }
+
+            } catch (error) {
+                console.error('Reservation Error:', error);
+                showNotification(error.message || 'เกิดข้อผิดพลาดในการเชื่อมต่อ', 'error');
+            } finally {
+                hideLoading();
+                confirmBtn.disabled = false;
+                confirmBtn.innerHTML = '<i class="fas fa-bookmark"></i> ยืนยันการจอง';
+            }
+        }
+
+        /**
+         * อัพเดทการ์ดหนังสือหลังจากจองสำเร็จ
+         */
+        function updateBookCardAfterReserve(bookId) {
+            const bookCard = document.querySelector(`[data-book-id="${bookId}"]`);
+            if (bookCard) {
+                // อัพเดทสถานะของการ์ด
+                bookCard.setAttribute('data-status', 'reserved');
+                
+                // อัพเดทปุ่มจอง
+                const reserveBtn = bookCard.querySelector('.btn-reserve');
+                if (reserveBtn) {
+                    reserveBtn.className = 'btn-reserve reserved';
+                    reserveBtn.disabled = true;
+                    reserveBtn.innerHTML = '<i class="fas fa-bookmark"></i> จองแล้ว';
+                }
+                
+                // อัพเดทสถานะในข้อมูล allBooks array สำหรับการค้นหา/กรอง
+                const bookIndex = allBooks.findIndex(book => book.book_id == bookId);
+                if (bookIndex !== -1) {
+                    allBooks[bookIndex].user_reserved = 1;
+                    allBooks[bookIndex].reserved_count = 1;
+                }
+                
+                // อัพเดท filteredBooks array ถ้าหนังสือนี้อยู่ในผลการค้นหาปัจจุบัน
+                const filteredIndex = filteredBooks.findIndex(book => book.book_id == bookId);
+                if (filteredIndex !== -1) {
+                    filteredBooks[filteredIndex].user_reserved = 1;
+                    filteredBooks[filteredIndex].reserved_count = 1;
+                }
+            }
+        }
+
+        // เพิ่มฟังก์ชันสำหรับรีเฟรช UI หลังจากการจอง
+        async function refreshBookDisplay() {
+            try {
+                const response = await fetch('get_updated_books.php');
+                const result = await response.json();
+                
+                if (result.success) {
+                    // อัพเดทข้อมูลหนังสือ
+                    allBooks = result.books;
+                    
+                    // หากมีการค้นหาหรือกรองอยู่ ให้ทำการกรองใหม่
+                    const searchInput = document.getElementById('searchInput');
+                    if (searchInput.value.trim()) {
+                        performSearch(searchInput.value.trim());
+                    } else if (Object.keys(activeFilters).length > 0) {
+                        applyFilters();
+                    } else {
+                        // แสดงหนังสือทั้งหมดใหม่
+                        displayBooks(allBooks);
+                    }
+                }
+            } catch (error) {
+                console.error('Error refreshing book display:', error);
+            }
+        }
+
+        /**
+         * อัพเดทสถิติผู้ใช้
+         */
+        async function updateUserStats() {
+            try {
+                const response = await fetch('get_user_stats.php');
+                const stats = await response.json();
+                
+                if (stats.success) {
+                    // อัพเดทจำนวนการจอง
+                    const reservationsCount = document.getElementById('user-reservations-count');
+                    if (reservationsCount) {
+                        reservationsCount.textContent = stats.data.reservations_count || 0;
+                    }
+                }
+            } catch (error) {
+                console.error('Error updating user stats:', error);
             }
         }
 
         // ========================
         // NOTIFICATION SYSTEM
         // ========================
-        function showNotification(message, type = 'success') {
-            // Remove existing notifications
-            document.querySelectorAll('.notification').forEach(n => n.remove());
 
+        /**
+         * แสดงการแจ้งเตือน
+         */
+        function showNotification(message, type = 'success') {
+            // ลบ notification เก่าถ้ามี
+            const existingNotification = document.querySelector('.notification');
+            if (existingNotification) {
+                existingNotification.remove();
+            }
+
+            // สร้าง notification ใหม่
             const notification = document.createElement('div');
             notification.className = `notification ${type}`;
             
-            const icon = {
-                'success': 'check-circle',
-                'error': 'exclamation-triangle', 
-                'warning': 'exclamation-circle'
-            }[type] || 'info-circle';
+            // เลือก icon ตามประเภท
+            let icon = 'fas fa-check-circle';
+            switch (type) {
+                case 'error':
+                    icon = 'fas fa-exclamation-circle';
+                    break;
+                case 'warning':
+                    icon = 'fas fa-exclamation-triangle';
+                    break;
+                case 'info':
+                    icon = 'fas fa-info-circle';
+                    break;
+            }
             
-            notification.innerHTML = `<i class="fas fa-${icon}"></i><span>${message}</span>`;
+            notification.innerHTML = `
+                <i class="${icon}"></i>
+                <span>${message}</span>
+            `;
+
+            // เพิ่มเข้า DOM
             document.body.appendChild(notification);
-            
-            // Show with animation
-            setTimeout(() => notification.classList.add('show'), 100);
-            
-            // Auto hide after 5 seconds
-            setTimeout(() => hideNotification(notification), 5000);
-        }
 
-        function hideNotification(notification) {
-            notification.classList.remove('show');
-            setTimeout(() => notification.remove(), 300);
+            // แสดง notification
+            setTimeout(() => {
+                notification.classList.add('show');
+            }, 100);
+
+            // ซ่อนหลังจาก 5 วินาที
+            setTimeout(() => {
+                notification.classList.remove('show');
+                setTimeout(() => {
+                    if (notification.parentNode) {
+                        notification.remove();
+                    }
+                }, 300);
+            }, 5000);
         }
 
         // ========================
-        // LOADING SYSTEM
+        // LOADING OVERLAY FUNCTIONS
         // ========================
+
+        /**
+         * แสดง Loading overlay
+         */
         function showLoading(message = 'กำลังดำเนินการ...') {
             const loadingOverlay = document.getElementById('loadingOverlay');
             if (loadingOverlay) {
                 const loadingText = loadingOverlay.querySelector('p');
-                if (loadingText) loadingText.textContent = message;
+                if (loadingText) {
+                    loadingText.textContent = message;
+                }
                 loadingOverlay.classList.add('show');
             }
         }
 
+        /**
+         * ซ่อน Loading overlay
+         */
         function hideLoading() {
             const loadingOverlay = document.getElementById('loadingOverlay');
-            if (loadingOverlay) loadingOverlay.classList.remove('show');
+            if (loadingOverlay) {
+                loadingOverlay.classList.remove('show');
+            }
         }
 
         // ========================
-        // MODAL SYSTEM
+        // IMAGE ERROR HANDLING
         // ========================
-        function showReserveModal(bookId, title, author, category, isbn) {
-            currentBookId = bookId;
+
+        /**
+         * จัดการกรณีที่รูปภาพโหลดไม่ได้
+         */
+        function handleImageError(img) {
+            // ซ่อนรูปภาพ
+            img.style.display = 'none';
             
-            // Update modal content
-            const elements = {
-                'modal-book-title': title,
-                'modal-book-author': `<i class="fas fa-user"></i> ${author}`,
-                'modal-book-category': `<i class="fas fa-tag"></i> ${category}`,
-                'modal-book-isbn': `<i class="fas fa-barcode"></i> ${isbn}`
+            // แสดง fallback icon
+            const fallbackIcon = img.parentElement.querySelector('.book-fallback-icon');
+            if (fallbackIcon) {
+                fallbackIcon.style.display = 'flex';
+            }
+        }
+
+        // ========================
+        // UTILITY FUNCTIONS
+        // ========================
+
+        /**
+         * ตรวจสอบการเชื่อมต่อเครือข่าย
+         */
+        function checkNetworkConnection() {
+            if (!navigator.onLine) {
+                showNotification('ไม่มีการเชื่อมต่ออินเทอร์เน็ต กรุณาตรวจสอบการเชื่อมต่อ', 'error');
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * Format วันที่เป็นภาษาไทย
+         */
+        function formatThaiDate(date) {
+            const options = { 
+                year: 'numeric', 
+                month: 'long', 
+                day: 'numeric',
+                locale: 'th-TH'
             };
-            
-            Object.entries(elements).forEach(([id, content]) => {
-                const element = document.getElementById(id);
-                if (element) element.innerHTML = content;
-            });
-            
-            // Show modal
-            const modal = document.getElementById('reserveModal');
-            if (modal) {
-                modal.style.display = 'block';
-                document.body.style.overflow = 'hidden';
-            }
+            return new Date(date).toLocaleDateString('th-TH', options);
         }
 
-        function closeModal(modalId) {
-            const modal = document.getElementById(modalId);
-            if (modal) {
-                modal.style.display = 'none';
-                document.body.style.overflow = 'auto';
-            }
-            currentBookId = null;
-        }
-
-        // ========================
-        // BOOK RESERVATION
-        // ========================
-        function confirmReserve() {
-            if (!currentBookId || isProcessing) return;
-
-            isProcessing = true;
-            showLoading('กำลังดำเนินการจองหนังสือ...');
-
-            fetch('reserve_book.php', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest'
-                },
-                body: JSON.stringify({ book_id: currentBookId })
-            })
-            .then(response => response.json())
-            .then(data => {
-                hideLoading();
-                isProcessing = false;
-                
-                if (data.success) {
-                    closeModal('reserveModal');
-                    showNotification('จองหนังสือสำเร็จ! รอแอดมินอนุมัติ', 'success');
-                    
-                    // Update UI
-                    updateBookCardAfterReserve(currentBookId);
-                    updateUserStats();
-                    
-                    // Auto refresh after 3 seconds
-                    setTimeout(() => window.location.reload(), 3000);
-                } else {
-                    showNotification(`ไม่สามารถจองหนังสือได้: ${data.message}`, 'error');
-                }
-            })
-            .catch(error => {
-                hideLoading();
-                isProcessing = false;
-                console.error('Reserve book error:', error);
-                showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่อีกครั้ง', 'error');
-            });
-        }
-
-        function updateBookCardAfterReserve(bookId) {
-            const bookCard = document.querySelector(`[data-book-id="${bookId}"]`);
-            if (bookCard) {
-                const reserveBtn = bookCard.querySelector('.btn-reserve');
-                if (reserveBtn) {
-                    reserveBtn.disabled = true;
-                    reserveBtn.classList.add('reserved');
-                    reserveBtn.innerHTML = '<i class="fas fa-bookmark"></i> จองแล้ว';
-                }
-            }
-        }
-
-        function updateUserStats() {
-            const reservationsCount = document.getElementById('user-reservations-count');
-            if (reservationsCount) {
-                const currentCount = parseInt(reservationsCount.textContent) || 0;
-                reservationsCount.textContent = currentCount + 1;
+        /**
+         * เลื่อนไปยังตำแหน่งที่กำหนด
+         */
+        function scrollToElement(elementId, offset = 0) {
+            const element = document.getElementById(elementId);
+            if (element) {
+                const elementPosition = element.offsetTop - offset;
+                window.scrollTo({
+                    top: elementPosition,
+                    behavior: 'smooth'
+                });
             }
         }
 
         // ========================
         // EVENT LISTENERS
         // ========================
+
+        // เมื่อ DOM โหลดเสร็จ
         document.addEventListener('DOMContentLoaded', function() {
-            // Modal close on outside click
-            document.addEventListener('click', function(e) {
-                if (e.target.classList.contains('modal')) {
-                    closeModal(e.target.id);
-                }
+            console.log('📚 Book Reservation System Initialized');
+            
+            // ตรวจสอบการเชื่อมต่อเครือข่าย
+            window.addEventListener('online', function() {
+                showNotification('เชื่อมต่ออินเทอร์เน็ตแล้ว', 'success');
             });
-
-            // Keyboard shortcuts
-            document.addEventListener('keydown', function(e) {
-                // Escape to close modal
-                if (e.key === 'Escape') {
-                    const reserveModal = document.getElementById('reserveModal');
-                    if (reserveModal?.style.display === 'block') {
-                        closeModal('reserveModal');
-                    }
-                }
-                
-                // Ctrl/Cmd + K to focus search
-                if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-                    e.preventDefault();
-                    const searchInput = document.getElementById('searchInput');
-                    if (searchInput) searchInput.focus();
-                }
+            
+            window.addEventListener('offline', function() {
+                showNotification('ขาดการเชื่อมต่ออินเทอร์เน็ต', 'warning');
             });
+        });
 
-            // Enhanced image error handling with better fallback
-            document.querySelectorAll('.book-image img').forEach(img => {
-                img.addEventListener('error', function() {
-                    handleImageError(this);
-                });
-                
-                // Also check if image is already broken on page load
-                if (img.complete && img.naturalHeight === 0) {
-                    handleImageError(img);
-                }
-            });
+        // ========================
+        // ERROR HANDLING
+        // ========================
 
-            // Search form enhancement
-            const searchForm = document.getElementById('searchForm');
-            if (searchForm) {
-                searchForm.addEventListener('submit', function(e) {
-                    const searchInput = document.getElementById('searchInput');
-                    if (searchInput && searchInput.value.trim() === '') {
-                        e.preventDefault();
-                        searchInput.focus();
-                        showNotification('กรุณาใส่คำค้นหา', 'warning');
-                    }
-                });
+        /**
+         * จัดการ errors ที่ไม่คาดคิด
+         */
+        window.addEventListener('error', function(event) {
+            console.error('JavaScript Error:', event.error);
+            
+            // แสดงข้อความข้อผิดพลาดให้ผู้ใช้ (เฉพาะใน development)
+            if (window.location.hostname === 'localhost') {
+                showNotification(`Error: ${event.error.message}`, 'error');
             }
+        });
 
-            // Add hover effects to book cards
-            document.querySelectorAll('.book-card').forEach(card => {
-                card.addEventListener('mouseenter', function() {
-                    if (!this.classList.contains('processing')) {
-                        this.style.transform = 'translateY(-8px)';
+        /**
+         * จัดการ Promise rejections
+         */
+        window.addEventListener('unhandledrejection', function(event) {
+            console.error('Unhandled Promise Rejection:', event.reason);
+            showNotification('เกิดข้อผิดพลาดในการประมวลผล กรุณาลองใหม่อีกครั้ง', 'error');
+        });
+
+        // ========================
+        // PERFORMANCE MONITORING
+        // ========================
+
+        // วัดเวลาในการโหลดหน้า
+        window.addEventListener('load', function() {
+            if (window.performance) {
+                const loadTime = window.performance.timing.loadEventEnd - window.performance.timing.navigationStart;
+                console.log(`⚡ Page loaded in ${loadTime}ms`);
+            }
+        });
+        
+
+        // ========================
+        // ACCESSIBILITY ENHANCEMENTS
+        // ========================
+
+        // เพิ่ม keyboard navigation สำหรับ modal
+        document.addEventListener('keydown', function(event) {
+            const modal = document.getElementById('reserveModal');
+            if (modal && modal.style.display === 'block') {
+                // Tab trap inside modal
+                if (event.key === 'Tab') {
+                    const focusableElements = modal.querySelectorAll(
+                        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+                    );
+                    const firstElement = focusableElements[0];
+                    const lastElement = focusableElements[focusableElements.length - 1];
+                    
+                    if (event.shiftKey && document.activeElement === firstElement) {
+                        event.preventDefault();
+                        lastElement.focus();
+                    } else if (!event.shiftKey && document.activeElement === lastElement) {
+                        event.preventDefault();
+                        firstElement.focus();
                     }
-                });
-                
-                card.addEventListener('mouseleave', function() {
-                    if (!this.classList.contains('processing')) {
-                        this.style.transform = 'translateY(0)';
-                    }
-                });
+                }
+            }
+        });
+    </script>
+
+    <!-- Additional Scripts -->
+    <script>
+        // Performance monitoring
+        window.addEventListener('load', function() {
+            if ('performance' in window) {
+                const loadTime = performance.now();
+                console.log(`📊 Page loaded in ${loadTime.toFixed(2)}ms`);
+            }
+        });
+
+        // Service Worker registration (for future PWA features)
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function() {
+                // Uncomment when service worker is implemented
+                // navigator.serviceWorker.register('/sw.js');
             });
-
-            console.log('📚 ห้องสมุดดิจิทัล - System Initialized Successfully!');
-            console.log('🖼️ Image paths configured for: ../uploads/covers/');
-            console.log('🔧 Image error handling configured');
-        });
-
-        // Global error handler
-        window.addEventListener('error', function(e) {
-            console.error('Global error:', e.error);
-            showNotification('เกิดข้อผิดพลาดระบบ กรุณาลองรีเฟรชหน้า', 'error');
-        });
+        }
     </script>
 </body>
 </html>

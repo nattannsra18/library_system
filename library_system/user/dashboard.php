@@ -27,127 +27,33 @@ $stmt = $pdo->prepare("SELECT * FROM users WHERE user_id = ?");
 $stmt->execute([$user_id]);
 $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
-// Get search parameters
-$search = isset($_GET['search']) ? trim($_GET['search']) : '';
-$category_id = isset($_GET['category']) ? (int)$_GET['category'] : 0;
-$page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
-$per_page = 12;
-$offset = ($page - 1) * $per_page;
-
-// Get all categories
-$stmt = $pdo->query("SELECT * FROM categories ORDER BY category_name");
-$categories = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Build query for books
-$where_conditions = [];
-$params = [];
-
-if (!empty($search)) {
-    $where_conditions[] = "(b.title LIKE :search OR b.subtitle LIKE :search OR b.isbn LIKE :search OR 
-                          a.first_name LIKE :search OR a.last_name LIKE :search)";
-    $params[':search'] = "%$search%";
-}
-
-if ($category_id > 0) {
-    $where_conditions[] = "b.category_id = :category_id";
-    $params[':category_id'] = $category_id;
-}
-
-$where_conditions[] = "b.status IN ('available', 'unavailable')";
-
-$where_sql = !empty($where_conditions) ? "WHERE " . implode(" AND ", $where_conditions) : "";
-
-// Get books with pagination
-$sql = "SELECT DISTINCT b.*, c.category_name, p.publisher_name,
-               GROUP_CONCAT(CONCAT(a.first_name, ' ', a.last_name) SEPARATOR ', ') as authors,
-               CASE 
-                   WHEN b.cover_image IS NOT NULL AND b.cover_image != '' 
-                   THEN CONCAT('uploads/covers/', b.cover_image)
-                   ELSE NULL 
-               END as cover_url
-        FROM books b
-        LEFT JOIN categories c ON b.category_id = c.category_id
-        LEFT JOIN publishers p ON b.publisher_id = p.publisher_id
-        LEFT JOIN book_authors ba ON b.book_id = ba.book_id
-        LEFT JOIN authors a ON ba.author_id = a.author_id
-        $where_sql
-        GROUP BY b.book_id
-        ORDER BY 
-            CASE WHEN b.status = 'available' THEN 1 ELSE 2 END,
-            b.created_at DESC
-        LIMIT :limit OFFSET :offset";
-
-$stmt = $pdo->prepare($sql);
-foreach ($params as $key => $value) {
-    $stmt->bindValue($key, $value);
-}
-$stmt->bindValue(':limit', $per_page, PDO::PARAM_INT);
-$stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
-$stmt->execute();
-$books = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Get total count for pagination
-$count_sql = "SELECT COUNT(DISTINCT b.book_id) as total
-              FROM books b
-              LEFT JOIN book_authors ba ON b.book_id = ba.book_id
-              LEFT JOIN authors a ON ba.author_id = a.author_id
-              $where_sql";
-
-$stmt = $pdo->prepare($count_sql);
-foreach ($params as $key => $value) {
-    $stmt->bindValue($key, $value);
-}
-$stmt->execute();
-$total_books = $stmt->fetchColumn();
-$total_pages = ceil($total_books / $per_page);
-
-// Get library stats
-$stats_query = "SELECT 
-    (SELECT COUNT(*) FROM books WHERE status = 'available') as total_books,
-    (SELECT COUNT(*) FROM users WHERE status = 'active') as total_users,
-    (SELECT COUNT(*) FROM borrowing) as total_borrows,
-    (SELECT COUNT(*) FROM categories) as total_categories";
-$stmt = $pdo->query($stats_query);
-$stats = $stmt->fetch(PDO::FETCH_ASSOC);
-
-// Get user's current borrowed books count
-$stmt = $pdo->prepare("SELECT COUNT(*) FROM borrowing WHERE user_id = ? AND status IN ('borrowed', 'overdue')");
-$stmt->execute([$user_id]);
-$user_borrowed_count = $stmt->fetchColumn();
-
-// Get user's total borrowed books count (all time)
-$stmt = $pdo->prepare("SELECT COUNT(*) FROM borrowing WHERE user_id = ?");
-$stmt->execute([$user_id]);
-$user_total_borrowed = $stmt->fetchColumn();
-
-// Get user's recent activity count
-$stmt = $pdo->prepare("SELECT COUNT(*) FROM borrowing WHERE user_id = ? AND borrow_date >= DATE_SUB(NOW(), INTERVAL 30 DAY)");
-$stmt->execute([$user_id]);
-$recent_activity_count = $stmt->fetchColumn();
-
-// Get recommended books based on user's history or popular books
+// Get current borrowed books
 $stmt = $pdo->prepare("
-    SELECT b.*, c.category_name, 
-           GROUP_CONCAT(CONCAT(a.first_name, ' ', a.last_name) SEPARATOR ', ') as authors,
-           CASE 
-               WHEN b.cover_image IS NOT NULL AND b.cover_image != '' 
-               THEN CONCAT('uploads/covers/', b.cover_image)
-               ELSE NULL 
-           END as cover_url
-    FROM books b
-    LEFT JOIN categories c ON b.category_id = c.category_id
-    LEFT JOIN book_authors ba ON b.book_id = ba.book_id
+    SELECT b.*, bo.title, bo.cover_image, c.category_name,
+           CONCAT(a.first_name, ' ', a.last_name) as author_name,
+           DATEDIFF(b.due_date, NOW()) as days_remaining
+    FROM borrowing b 
+    JOIN books bo ON b.book_id = bo.book_id 
+    LEFT JOIN categories c ON bo.category_id = c.category_id
+    LEFT JOIN book_authors ba ON bo.book_id = ba.book_id
     LEFT JOIN authors a ON ba.author_id = a.author_id
-    WHERE b.status IN ('available', 'unavailable')
-    GROUP BY b.book_id
-    ORDER BY 
-        CASE WHEN b.status = 'available' THEN 1 ELSE 2 END,
-        RAND()
-    LIMIT 6
+    WHERE b.user_id = ? AND b.status IN ('borrowed', 'overdue', 'pending_return')
+    ORDER BY b.due_date ASC
 ");
+$stmt->execute([$user_id]);
+$current_borrows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-$stmt->execute();
-$recommended_books = $stmt->fetchAll(PDO::FETCH_ASSOC);
+// Get current active reservations
+$stmt = $pdo->prepare("
+    SELECT r.*, bo.title, bo.cover_image, c.category_name
+    FROM reservations r
+    JOIN books bo ON r.book_id = bo.book_id
+    LEFT JOIN categories c ON bo.category_id = c.category_id
+    WHERE r.user_id = ? AND r.status = 'active'
+    ORDER BY r.reservation_date DESC
+");
+$stmt->execute([$user_id]);
+$current_reservations = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Get notifications
 $stmt = $pdo->prepare("
@@ -159,15 +65,18 @@ $stmt = $pdo->prepare("
 $stmt->execute([$user_id]);
 $notifications = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Get system settings for borrowing limits
-$stmt = $pdo->prepare("SELECT setting_key, setting_value FROM system_settings WHERE setting_key IN ('max_borrow_books', 'max_borrow_days')");
-$stmt->execute();
-$settings = [];
-while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-    $settings[$row['setting_key']] = $row['setting_value'];
-}
-$max_borrow_books = (int)($settings['max_borrow_books'] ?? 5);
-$max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
+// Get borrowing statistics
+$stmt = $pdo->prepare("
+    SELECT 
+        COUNT(*) as total_borrowed,
+        COUNT(CASE WHEN status = 'returned' THEN 1 END) as total_returned,
+        COUNT(CASE WHEN status = 'overdue' THEN 1 END) as overdue_count,
+        COUNT(CASE WHEN status = 'pending_return' THEN 1 END) as pending_return_count
+    FROM borrowing 
+    WHERE user_id = ?
+");
+$stmt->execute([$user_id]);
+$stats = $stmt->fetch(PDO::FETCH_ASSOC);
 ?>
 
 <!DOCTYPE html>
@@ -175,20 +84,21 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>หน้าแรก - ห้องสมุดดิจิทัล</title>
+    <title>แดชบอร์ดผู้ใช้ - ห้องสมุดดิจิทัล</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        * { 
+            margin: 0; 
+            padding: 0; 
+            box-sizing: border-box; 
         }
-
+        
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            line-height: 1.6;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
             color: #333;
-            background-color: #f8f9fa;
+            line-height: 1.6;
+            min-height: 100vh;
         }
 
         /* Header */
@@ -200,7 +110,7 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
             width: 100%;
             top: 0;
             z-index: 1000;
-            box-shadow: 0 2px 20px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
         }
 
         .nav-container {
@@ -219,10 +129,7 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
             font-weight: bold;
         }
 
-        .logo i {
-            margin-right: 10px;
-            font-size: 2rem;
-        }
+        .logo i { margin-right: 10px; font-size: 2rem; }
 
         .nav-links {
             display: flex;
@@ -233,20 +140,14 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
         .nav-links a {
             color: white;
             text-decoration: none;
-            transition: all 0.3s ease;
             padding: 0.5rem 1rem;
             border-radius: 8px;
+            transition: all 0.3s ease;
         }
 
         .nav-links a:hover, .nav-links a.active {
             background: rgba(255,255,255,0.2);
             transform: translateY(-2px);
-        }
-
-        .user-menu {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
         }
 
         .btn-logout {
@@ -257,7 +158,6 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
             border-radius: 25px;
             text-decoration: none;
             transition: all 0.3s ease;
-            font-weight: 500;
         }
 
         .btn-logout:hover {
@@ -266,385 +166,676 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
             transform: translateY(-2px);
         }
 
-        /* Welcome Banner */
-        .welcome-banner {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 120px 0 60px;
-            text-align: center;
-        }
-
-        .welcome-container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 0 2rem;
-        }
-
-        .welcome-banner h1 {
-            font-size: 2.5rem;
-            margin-bottom: 1rem;
-            font-weight: 700;
-        }
-
-        .welcome-banner p {
-            font-size: 1.2rem;
-            margin-bottom: 2rem;
-            opacity: 0.9;
-        }
-
-        .user-stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1.5rem;
-            margin-top: 2rem;
-        }
-
-        .user-stat-card {
-            background: rgba(255,255,255,0.15);
-            padding: 1.5rem;
-            border-radius: 15px;
-            text-align: center;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255,255,255,0.2);
-        }
-
-        .user-stat-card i {
-            font-size: 2rem;
-            margin-bottom: 0.5rem;
-        }
-
-        .user-stat-number {
-            font-size: 1.8rem;
-            font-weight: bold;
-            margin-bottom: 0.25rem;
-        }
-
-        .user-stat-label {
-            font-size: 0.9rem;
-            opacity: 0.9;
-        }
-
-        /* Enhanced Search Section */
-        .search-section {
-            background: white;
-            padding: 3rem 0;
-            margin-bottom: 2rem;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-        }
-
-        .search-container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 0 2rem;
-            position: relative;
-        }
-
-        .search-section h2 {
-            text-align: center;
-            font-size: 2rem;
-            color: #333;
-            margin-bottom: 2rem;
-        }
-
-        .search-form {
-            background: #f8f9fa;
-            border-radius: 50px;
-            padding: 10px;
-            display: flex;
-            box-shadow: 0 8px 25px rgba(0,0,0,0.1);
-            margin-bottom: 2rem;
-            position: relative;
-        }
-
-        .search-input {
-            flex: 1;
-            border: none;
-            padding: 1rem 1.5rem;
-            font-size: 1.1rem;
-            border-radius: 40px;
-            outline: none;
-            background: transparent;
-        }
-
-        .search-btn {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 1rem 2rem;
-            border-radius: 40px;
-            cursor: pointer;
-            font-size: 1.1rem;
-            transition: all 0.3s ease;
-        }
-
-        .search-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-        }
-
-        .category-filters {
-            display: flex;
-            gap: 1rem;
-            justify-content: center;
-            flex-wrap: wrap;
-        }
-
-        .category-btn {
-            background: #f8f9fa;
-            color: #667eea;
-            border: 2px solid #667eea;
-            padding: 0.5rem 1rem;
-            border-radius: 25px;
-            text-decoration: none;
-            transition: all 0.3s ease;
-            font-size: 0.9rem;
-        }
-
-        .category-btn:hover, .category-btn.active {
-            background: #667eea;
-            color: white;
-        }
-
         /* Main Content */
-        .main-content {
+        .dashboard-container {
             max-width: 1200px;
-            margin: 0 auto;
-            padding: 0 2rem;
+            margin: 100px auto 20px;
+            padding: 0 20px;
         }
 
-        .content-wrapper {
-            width: 100%;
-        }
-
-        .section {
-            background: white;
-            border-radius: 15px;
-            padding: 2rem;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        /* Welcome Section */
+        .welcome-section {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 2.5rem;
+            border-radius: 20px;
             margin-bottom: 2rem;
-        }
-
-        .section-header {
             display: flex;
             align-items: center;
-            gap: 1rem;
-            margin-bottom: 1.5rem;
-            padding-bottom: 1rem;
-            border-bottom: 2px solid #f0f0f0;
-        }
-
-        .section-header h3 {
-            font-size: 1.5rem;
-            color: #333;
-        }
-
-        .section-header i {
-            color: #667eea;
-            font-size: 1.5rem;
-        }
-
-        /* Quick Actions */
-        .quick-actions {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 2rem;
-        }
-
-        .quick-action {
-            background: white;
-            padding: 1.5rem;
-            border-radius: 15px;
-            text-align: center;
-            text-decoration: none;
-            color: #333;
-            transition: all 0.3s ease;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-        }
-
-        .quick-action:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 30px rgba(0,0,0,0.15);
-        }
-
-        .quick-action i {
-            font-size: 2.5rem;
-            color: #667eea;
-            margin-bottom: 1rem;
-        }
-
-        .quick-action h4 {
-            font-size: 1.2rem;
-            margin-bottom: 0.5rem;
-        }
-
-        .quick-action p {
-            color: #666;
-            font-size: 0.9rem;
-        }
-
-        /* Books Grid */
-        .books-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
             gap: 2rem;
-        }
-
-        .book-card {
-            background: white;
-            border-radius: 15px;
-            overflow: hidden;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            transition: all 0.3s ease;
+            box-shadow: 0 15px 40px rgba(102, 126, 234, 0.3);
             position: relative;
-            border: 1px solid #f0f0f0;
+            overflow: hidden;
         }
 
-        .book-card:hover {
-            transform: translateY(-8px);
-            box-shadow: 0 20px 40px rgba(0,0,0,0.15);
-        }
-
-        .book-image {
+        .welcome-section::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            right: -10%;
+            width: 200px;
             height: 200px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: rgba(255,255,255,0.1);
+            border-radius: 50%;
+            animation: float 6s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px) rotate(0deg); }
+            50% { transform: translateY(-20px) rotate(180deg); }
+        }
+
+        .profile-img {
+            width: 110px;
+            height: 110px;
+            border-radius: 50%;
+            border: 4px solid rgba(255,255,255,0.3);
+            background: rgba(255,255,255,0.2);
             display: flex;
             align-items: center;
             justify-content: center;
-            color: white;
-            font-size: 3rem;
+            font-size: 2.5rem;
             position: relative;
-            overflow: hidden;
+            z-index: 2;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.2);
         }
 
-        .book-image img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            transition: opacity 0.3s ease;
-        }
-
-        .book-availability {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            background: rgba(0,0,0,0.7);
-            color: white;
-            padding: 0.3rem 0.8rem;
-            border-radius: 15px;
-            font-size: 0.8rem;
+        .welcome-text {
+            position: relative;
             z-index: 2;
         }
 
-        .book-info {
-            padding: 1.5rem;
+        .welcome-text h1 {
+            font-size: 2.8rem;
+            margin-bottom: 0.8rem;
+            font-weight: 700;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
 
-        .book-title {
-            font-size: 1.1rem;
-            font-weight: bold;
-            margin-bottom: 0.5rem;
-            color: #333;
-            line-height: 1.3;
-            height: 2.6rem;
+        .welcome-text p { 
+            opacity: 0.95; 
+            font-size: 1.1rem; 
+            margin-bottom: 0.3rem;
+        }
+
+        /* Quick Stats */
+        .quick-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, #fff 0%, #f8f9fa 100%);
+            padding: 2rem 1.5rem;
+            border-radius: 20px;
+            text-align: center;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.08);
+            transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            position: relative;
             overflow: hidden;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
+            border: 1px solid rgba(102, 126, 234, 0.1);
         }
 
-        .book-author {
-            color: #666;
-            margin-bottom: 0.5rem;
-            font-size: 0.9rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            border-radius: 20px 20px 0 0;
         }
 
-        .book-isbn {
-            color: #888;
-            font-size: 0.8rem;
-            margin-bottom: 0.5rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
+        .stat-card.borrowed::before { background: linear-gradient(90deg, #667eea, #764ba2); }
+        .stat-card.returned::before { background: linear-gradient(90deg, #4caf50, #45a049); }
+        .stat-card.overdue::before { background: linear-gradient(90deg, #f44336, #e53935); }
+        .stat-card.pending::before { background: linear-gradient(90deg, #ff9800, #f57c00); }
+        .stat-card.reserved::before { background: linear-gradient(90deg, #9c27b0, #8e24aa); }
+
+        .stat-card:hover { 
+            transform: translateY(-8px) scale(1.02); 
+            box-shadow: 0 15px 40px rgba(0,0,0,0.15);
         }
 
-        .book-category {
-            display: inline-block;
-            background: #e3f2fd;
-            color: #1976d2;
-            padding: 0.3rem 0.8rem;
-            border-radius: 15px;
-            font-size: 0.8rem;
-            margin-bottom: 1rem;
+        .stat-card i { 
+            font-size: 3rem; 
+            margin-bottom: 1.2rem; 
+            display: block;
+        }
+        .stat-card.borrowed i { color: #667eea; }
+        .stat-card.returned i { color: #4caf50; }
+        .stat-card.overdue i { color: #f44336; }
+        .stat-card.pending i { color: #ff9800; }
+        .stat-card.reserved i { color: #9c27b0; }
+
+        .stat-number { 
+            font-size: 2.2rem; 
+            font-weight: 700; 
+            margin-bottom: 0.5rem; 
+            color: #333; 
+        }
+        .stat-label { 
+            color: #666; 
+            font-size: 0.95rem; 
+            font-weight: 500;
         }
 
-        .book-actions {
-            display: flex;
-            gap: 0.5rem;
+        /* Dashboard Grid */
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 2.5rem;
+            margin-bottom: 2rem;
         }
 
-        .btn-reserve {
-            flex: 1;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 0.8rem 1rem;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 0.9rem;
+        .card {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 10px 35px rgba(0, 0, 0, 0.08);
+            border-radius: 25px;
+            overflow: hidden;
             transition: all 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.15);
+        }
+
+        /* Enhanced Tabs */
+        .tabs {
+            background: transparent;
+            padding: 1.5rem 1.5rem 0 1.5rem;
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 1.2rem 1rem;
+            text-align: center;
+            cursor: pointer;
+            background: rgba(102, 126, 234, 0.08);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(102, 126, 234, 0.15);
+            border-radius: 15px 15px 0 0;
+            transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            font-weight: 500;
             display: flex;
             align-items: center;
             justify-content: center;
             gap: 0.5rem;
+            position: relative;
+            overflow: hidden;
         }
 
-        .btn-reserve:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        .tab::before {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transform: scaleX(0);
+            transition: transform 0.3s ease;
         }
 
-        .btn-reserve:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-            transform: none !important;
+        .tab:hover:not(.active) {
+            transform: translateY(-3px);
+            background: rgba(102, 126, 234, 0.12);
+            border-color: rgba(102, 126, 234, 0.25);
         }
 
-        .btn-reserve.reserved {
-            background: #28a745;
+        .tab.active {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.15), rgba(118, 75, 162, 0.15));
+            backdrop-filter: blur(20px);
+            border-color: rgba(102, 126, 234, 0.3);
+            transform: translateY(-5px) scale(1.02);
+            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.2);
+            color: #667eea;
+            font-weight: 600;
         }
 
-        /* Modal Styles */
+        .tab.active::before {
+            transform: scaleX(1);
+        }
+
+        .tab-badge {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 0.3rem 0.6rem;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            margin-left: 0.5rem;
+            min-width: 20px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+        }
+
+        .tab.active .tab-badge {
+            background: linear-gradient(135deg, #5a67d8, #667eea);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+        }
+
+        /* Tab Content */
+        .tab-content {
+            display: none;
+            background: transparent;
+            padding: 2rem;
+            max-height: 550px;
+            overflow-y: auto;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(102, 126, 234, 0.3) transparent;
+        }
+
+        .tab-content::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .tab-content::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .tab-content::-webkit-scrollbar-thumb {
+            background: rgba(102, 126, 234, 0.3);
+            border-radius: 3px;
+        }
+
+        .tab-content.active { display: block; }
+
+        /* Enhanced Book Items */
+        .book-item {
+            display: flex;
+            gap: 1.5rem;
+            padding: 2rem;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.9), rgba(248, 249, 250, 0.9));
+            backdrop-filter: blur(15px);
+            border: 1px solid rgba(102, 126, 234, 0.1);
+            border-radius: 20px;
+            margin-bottom: 1.5rem;
+            transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .book-item::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transform: scaleX(0);
+            transition: transform 0.3s ease;
+        }
+
+        .book-item:hover {
+            transform: translateY(-8px) scale(1.01);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.12), 0 8px 25px rgba(102, 126, 234, 0.15);
+        }
+
+        .book-item:hover::before {
+            transform: scaleX(1);
+        }
+
+        .book-cover {
+            width: 80px;
+            height: 110px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 2rem;
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.3);
+            transition: all 0.3s ease;
+            flex-shrink: 0;
+        }
+
+        .book-item:hover .book-cover { 
+            transform: scale(1.05) rotateY(10deg); 
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
+        }
+
+        .book-details { 
+            flex: 1; 
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .book-details h4 {
+            font-size: 1.3rem;
+            color: #333;
+            margin-bottom: 0.8rem;
+            font-weight: 600;
+            line-height: 1.3;
+        }
+
+        .book-details p {
+            color: #666;
+            font-size: 0.95rem;
+            margin-bottom: 0.4rem;
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+        }
+
+        .book-details p i { 
+            color: #667eea; 
+            width: 18px; 
+            font-size: 0.9rem;
+        }
+
+        /* Book Actions */
+        .book-actions {
+            display: flex;
+            flex-direction: column;
+            gap: 0.8rem;
+            align-items: flex-end;
+            min-width: 140px;
+        }
+
+        /* Enhanced Due Date Badges */
+        .due-date {
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            backdrop-filter: blur(10px);
+        }
+
+        .due-soon { 
+            background: linear-gradient(135deg, #fff3cd, #ffeaa7); 
+            color: #856404; 
+            border: 1px solid #ffeaa7;
+        }
+        .overdue { 
+            background: linear-gradient(135deg, #f8d7da, #ffbaba); 
+            color: #721c24; 
+            border: 1px solid #ffbaba;
+        }
+        .normal { 
+            background: linear-gradient(135deg, #d1ecf1, #a8e6cf); 
+            color: #0c5460; 
+            border: 1px solid #a8e6cf;
+        }
+        .pending-return { 
+            background: linear-gradient(135deg, #e2e3e5, #d6d8db); 
+            color: #383d41; 
+            border: 1px solid #d6d8db;
+        }
+        .reserved-status { 
+            background: linear-gradient(135deg, #e1bee7, #ce93d8); 
+            color: #4a148c; 
+            border: 1px solid #ce93d8;
+        }
+
+        /* Enhanced Buttons */
+        .btn-return, .btn-cancel {
+            background: linear-gradient(135deg, #28a745, #20c997);
+            color: white;
+            border: none;
+            padding: 0.6rem 1.2rem;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            box-shadow: 0 4px 15px rgba(40, 167, 69, 0.3);
+        }
+
+        .btn-cancel { 
+            background: linear-gradient(135deg, #dc3545, #e55353); 
+            box-shadow: 0 4px 15px rgba(220, 53, 69, 0.3);
+        }
+        
+        .btn-pending { 
+            background: linear-gradient(135deg, #6c757d, #868e96); 
+            cursor: not-allowed; 
+            box-shadow: 0 4px 15px rgba(108, 117, 125, 0.3);
+        }
+
+        .btn-return:hover:not(:disabled) { 
+            background: linear-gradient(135deg, #218838, #1e7e34); 
+            transform: translateY(-2px) scale(1.05); 
+            box-shadow: 0 6px 20px rgba(40, 167, 69, 0.4);
+        }
+        
+        .btn-cancel:hover:not(:disabled) { 
+            background: linear-gradient(135deg, #c82333, #bd2130); 
+            transform: translateY(-2px) scale(1.05); 
+            box-shadow: 0 6px 20px rgba(220, 53, 69, 0.4);
+        }
+
+        /* Enhanced Notifications */
+        .card-header {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1), rgba(118, 75, 162, 0.1));
+            color: #333;
+            padding: 2rem 1.5rem 1.5rem 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            border-bottom: 1px solid rgba(102, 126, 234, 0.15);
+            position: relative;
+        }
+
+        .card-header::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 1.5rem;
+            right: 1.5rem;
+            height: 2px;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            border-radius: 2px;
+        }
+
+        .card-header i {
+            font-size: 1.8rem;
+            color: #667eea;
+            animation: bellShake 3s infinite;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1), rgba(118, 75, 162, 0.1));
+            padding: 0.5rem;
+            border-radius: 12px;
+        }
+
+        @keyframes bellShake {
+            0%, 50%, 100% { transform: rotate(0deg); }
+            10%, 30% { transform: rotate(-15deg); }
+            20%, 40% { transform: rotate(15deg); }
+        }
+
+        .card-content { 
+            padding: 0; 
+            max-height: 450px; 
+            overflow-y: auto; 
+        }
+
+        .notification-item {
+            display: flex;
+            gap: 1.5rem;
+            padding: 2rem 1.5rem;
+            border-bottom: 1px solid rgba(102, 126, 234, 0.08);
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.5), rgba(248, 249, 250, 0.5));
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .notification-item::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            background: linear-gradient(180deg, #667eea, #764ba2);
+            transform: scaleY(0);
+            transition: transform 0.3s ease;
+        }
+
+        .notification-item:hover {
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.8), rgba(248, 249, 250, 0.8));
+            transform: translateX(8px);
+        }
+
+        .notification-item:hover::before {
+            transform: scaleY(1);
+        }
+
+        .notification-icon {
+            width: 50px;
+            height: 50px;
+            border-radius: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.3rem;
+            color: white;
+            flex-shrink: 0;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .notification-icon::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: linear-gradient(45deg, transparent, rgba(255,255,255,0.2), transparent);
+            transform: rotate(45deg);
+            transition: all 0.5s ease;
+        }
+
+        .notification-item:hover .notification-icon::before {
+            animation: shimmer 1s ease;
+        }
+
+        @keyframes shimmer {
+            0% { transform: translateX(-100%) translateY(-100%) rotate(45deg); }
+            100% { transform: translateX(100%) translateY(100%) rotate(45deg); }
+        }
+
+        .notification-icon.warning { background: linear-gradient(135deg, #ff9800, #f57c00); }
+        .notification-icon.success { background: linear-gradient(135deg, #4caf50, #2e7d32); }
+        .notification-icon.info { background: linear-gradient(135deg, #667eea, #764ba2); }
+        .notification-icon.error { background: linear-gradient(135deg, #f44336, #d32f2f); }
+
+        .notification-content { 
+            flex: 1; 
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        
+        .notification-content h4 { 
+            font-size: 1.1rem; 
+            color: #333; 
+            font-weight: 600;
+            margin-bottom: 0.3rem; 
+        }
+        
+        .notification-content p { 
+            color: #666; 
+            font-size: 0.95rem; 
+            line-height: 1.5;
+            margin-bottom: 0.5rem; 
+        }
+        
+        .notification-time { 
+            color: #999; 
+            font-size: 0.8rem; 
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        /* Enhanced Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 4rem 2rem;
+            color: #666;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.5), rgba(248, 249, 250, 0.5));
+            border: 2px dashed rgba(102, 126, 234, 0.2);
+            border-radius: 25px;
+            margin: 2rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .empty-state::before {
+            content: '';
+            position: absolute;
+            top: -2px;
+            left: -2px;
+            right: -2px;
+            bottom: -2px;
+            background: linear-gradient(45deg, #c0caf7ff, #c0caf7ff, #c0caf7ff, #c0caf7ff);
+            background-size: 400% 400%;
+            border-radius: 25px;
+            z-index: -1;
+            animation: borderGlow 4s ease-in-out infinite;
+        }
+
+        @keyframes borderGlow {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+
+        .empty-state i { 
+            font-size: 4rem; 
+            color: rgba(102, 126, 234, 0.4); 
+            margin-bottom: 1.5rem; 
+            display: block;
+        }
+        
+        .empty-state h4 { 
+            font-size: 1.4rem; 
+            margin-bottom: 0.8rem; 
+            color: #333; 
+            font-weight: 600;
+        }
+
+        .empty-state p {
+            font-size: 1rem;
+            line-height: 1.6;
+            opacity: 0.8;
+        }
+
+        /* Modal Styles - Enhanced */
         .modal {
             display: none;
             position: fixed;
-            z-index: 10000;
+            z-index: 9999;
             left: 0;
             top: 0;
             width: 100%;
             height: 100%;
-            background-color: rgba(0, 0, 0, 0.6);
-            backdrop-filter: blur(5px);
+            background-color: rgba(0,0,0,0.6);
+            backdrop-filter: blur(8px);
         }
 
         .modal-content {
-            background: #fefefe;
-            margin: 5% auto;
-            border-radius: 20px;
+            background: linear-gradient(135deg, #fff 0%, #f8f9fa 100%);
+            margin: 3% auto;
+            padding: 0;
+            border-radius: 25px;
             width: 90%;
-            max-width: 600px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            animation: modalAppear 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+            max-width: 550px;
+            box-shadow: 0 25px 60px rgba(0,0,0,0.3);
+            animation: modalSlideIn 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
             overflow: hidden;
+            border: 1px solid rgba(102, 126, 234, 0.1);
         }
 
-        @keyframes modalAppear {
+        @keyframes modalSlideIn {
             from { 
                 opacity: 0; 
-                transform: translateY(-30px) scale(0.9); 
+                transform: translateY(-100px) scale(0.8); 
             }
             to { 
                 opacity: 1; 
@@ -656,101 +847,169 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             padding: 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             position: relative;
         }
 
+        .modal-header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(255,255,255,0.1), transparent);
+        }
+
         .modal-header h3 {
-            margin: 0;
-            font-size: 1.5rem;
+            font-size: 1.4rem;
             font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
+            position: relative;
+            z-index: 2;
         }
 
         .close {
-            position: absolute;
-            right: 1.5rem;
-            top: 50%;
-            transform: translateY(-50%);
+            background: rgba(255,255,255,0.1);
+            border: 2px solid rgba(255,255,255,0.2);
             color: white;
-            font-size: 2rem;
-            font-weight: 300;
+            font-size: 1.5rem;
             cursor: pointer;
-            transition: all 0.3s ease;
             width: 40px;
             height: 40px;
+            border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
-            border-radius: 50%;
+            transition: all 0.3s ease;
+            position: relative;
+            z-index: 2;
         }
 
         .close:hover {
-            background: rgba(255, 255, 255, 0.2);
-            transform: translateY(-50%) rotate(90deg);
+            background: rgba(255,255,255,0.2);
+            transform: scale(1.1);
         }
 
-        .modal-body {
-            padding: 2rem;
+        .modal-body { 
+            padding: 2.5rem; 
         }
 
         .modal-book-info {
             display: flex;
             gap: 1.5rem;
-            margin-bottom: 1.5rem;
+            margin-bottom: 2rem;
             padding: 1.5rem;
-            background: linear-gradient(135deg, #f8f9ff 0%, #e8f4fd 100%);
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.05), rgba(118, 75, 162, 0.05));
             border-radius: 15px;
-            border-left: 4px solid #667eea;
+            border: 1px solid rgba(102, 126, 234, 0.1);
         }
 
         .modal-book-cover {
-            width: 80px;
-            height: 100px;
+            width: 70px;
+            height: 95px;
+            border-radius: 12px;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border-radius: 10px;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
-            font-size: 2rem;
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+            font-size: 1.8rem;
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.3);
+        }
+
+        .modal-book-details {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
         }
 
         .modal-book-details h4 {
-            color: #2c3e50;
             font-size: 1.2rem;
-            margin-bottom: 0.75rem;
+            color: #333;
             font-weight: 600;
+            margin-bottom: 0.5rem;
         }
 
         .modal-book-details p {
-            margin: 0.5rem 0;
-            color: #7f8c8d;
-            font-size: 0.95rem;
+            color: #666;
+            font-size: 0.9rem;
             display: flex;
             align-items: center;
             gap: 0.5rem;
         }
 
-        .modal-book-details i {
-            color: #667eea;
-            width: 16px;
+        .modal-actions {
+            display: flex;
+            gap: 1rem;
+            justify-content: flex-end;
+            padding-top: 1rem;
+            border-top: 1px solid rgba(102, 126, 234, 0.1);
         }
 
+        .btn-modal {
+            padding: 0.8rem 1.8rem;
+            border: none;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .btn-modal-primary { 
+            background: linear-gradient(135deg, #667eea, #764ba2); 
+            color: white; 
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        
+        .btn-modal-danger { 
+            background: linear-gradient(135deg, #dc3545, #e55353); 
+            color: white; 
+            box-shadow: 0 4px 15px rgba(220, 53, 69, 0.3);
+        }
+        
+        .btn-modal-secondary { 
+            background: #f8f9fa; 
+            color: #666; 
+            border: 2px solid #e1e5e9; 
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+
+        .btn-modal:hover {
+            transform: translateY(-2px) scale(1.05);
+        }
+
+        .btn-modal-primary:hover {
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-modal-danger:hover {
+            box-shadow: 0 6px 20px rgba(220, 53, 69, 0.4);
+        }
+
+        .btn-modal-secondary:hover {
+            background: #e9ecef;
+            border-color: #adb5bd;
+        }
+
+        /* Enhanced Info Box */
         .info-box {
-            background: linear-gradient(135deg, #e8f5e8 0%, #f0f8f0 100%);
-            border: 1px solid #c3e6c3;
-            border-left: 4px solid #27ae60;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.08), rgba(118, 75, 162, 0.08));
+            border: 1px solid rgba(102, 126, 234, 0.15);
             padding: 1.5rem;
-            border-radius: 10px;
+            border-radius: 15px;
             margin-bottom: 1.5rem;
         }
 
         .info-box h4 {
-            color: #27ae60;
-            margin-bottom: 1rem;
+            color: #333;
+            margin-bottom: 0.8rem;
             font-size: 1.1rem;
             font-weight: 600;
             display: flex;
@@ -759,161 +1018,104 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
         }
 
         .info-box p {
-            margin: 0.75rem 0;
-            color: #2d5a3d;
+            margin: 0.4rem 0;
+            color: #666;
             font-size: 0.95rem;
             line-height: 1.5;
-            padding-left: 1.5rem;
-            position: relative;
         }
 
-        .info-box p::before {
-            content: "•";
-            color: #27ae60;
-            position: absolute;
-            left: 0.5rem;
-            font-weight: bold;
+        .warning-box {
+            background: linear-gradient(135deg, rgba(255, 193, 7, 0.1), rgba(255, 235, 59, 0.1));
+            border: 1px solid rgba(255, 193, 7, 0.3);
         }
 
-        .modal-actions {
-            display: flex;
-            gap: 1rem;
-            justify-content: flex-end;
-            margin-top: 2rem;
+        .warning-box p {
+            color: #856404;
         }
 
-        .btn-modal {
-            padding: 1rem 2rem;
-            border: none;
-            border-radius: 10px;
-            cursor: pointer;
-            font-size: 1rem;
-            font-weight: 500;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            min-width: 140px;
-            justify-content: center;
-        }
-
-        .btn-modal-secondary {
-            background: #f8f9fa;
-            color: #6c757d;
-            border: 2px solid #dee2e6;
-        }
-
-        .btn-modal-secondary:hover {
-            background: #e9ecef;
-            transform: translateY(-2px);
-        }
-
-        .btn-modal-primary {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
-        }
-
-        .btn-modal-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
-        }
-
-        /* Pagination */
-        .pagination {
-            display: flex;
-            justify-content: center;
-            gap: 0.5rem;
-            margin-top: 2rem;
-        }
-
-        .pagination a, .pagination span {
-            padding: 0.8rem 1rem;
-            border-radius: 8px;
-            text-decoration: none;
-            transition: all 0.3s ease;
-        }
-
-        .pagination a {
-            background: white;
-            color: #667eea;
-            border: 2px solid #667eea;
-        }
-
-        .pagination a:hover {
-            background: #667eea;
-            color: white;
-        }
-
-        .pagination .current {
-            background: #667eea;
-            color: white;
-            border: 2px solid #667eea;
-        }
-
-        /* Notification */
-        .notification {
+        /* Notification Toast - Enhanced */
+        .notification-toast {
             position: fixed;
-            top: 100px;
+            top: 120px;
             right: 20px;
-            padding: 1rem 1.5rem;
-            border-radius: 10px;
+            padding: 1.2rem 1.8rem;
+            border-radius: 15px;
             color: white;
             font-weight: 500;
-            z-index: 9999;
-            transform: translateX(100%);
-            transition: transform 0.3s ease;
+            z-index: 9998;
+            transform: translateX(120%);
+            transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
             display: flex;
             align-items: center;
-            gap: 0.5rem;
-            max-width: 400px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            gap: 1rem;
+            min-width: 320px;
+            max-width: 420px;
+            backdrop-filter: blur(15px);
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
         }
 
-        .notification.show {
-            transform: translateX(0);
+        .notification-toast.show { 
+            transform: translateX(0); 
         }
 
-        .notification.success {
-            background: #4caf50;
+        .notification-toast i {
+            font-size: 1.3rem;
         }
 
-        .notification.error {
-            background: #f44336;
+        .notification-toast .close-btn {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            border-radius: 50%;
+            width: 28px;
+            height: 28px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+            margin-left: auto;
         }
 
-        .notification.warning {
-            background: #ff9800;
+        .notification-toast .close-btn:hover {
+            background: rgba(255,255,255,0.3);
+            transform: scale(1.1);
         }
 
-        /* Loading overlay */
-        .loading-overlay {
+        /* Loading Overlay - Enhanced */
+        .loading {
+            display: none;
             position: fixed;
             top: 0;
             left: 0;
             width: 100%;
             height: 100%;
             background: rgba(0,0,0,0.7);
-            display: none;
+            backdrop-filter: blur(8px);
+            z-index: 9999;
             justify-content: center;
             align-items: center;
-            z-index: 10000;
             color: white;
-            flex-direction: column;
         }
 
-        .loading-overlay.show {
-            display: flex;
+        .loading-content {
+            text-align: center;
+            background: rgba(255,255,255,0.1);
+            padding: 3rem;
+            border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.2);
+            backdrop-filter: blur(20px);
         }
 
         .spinner {
             border: 4px solid rgba(255,255,255,0.3);
-            border-top: 4px solid white;
+            border-top: 4px solid #667eea;
             border-radius: 50%;
-            width: 50px;
-            height: 50px;
+            width: 60px;
+            height: 60px;
             animation: spin 1s linear infinite;
-            margin-bottom: 1rem;
+            margin: 0 auto 1.5rem;
         }
 
         @keyframes spin {
@@ -921,114 +1123,62 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
             100% { transform: rotate(360deg); }
         }
 
-        /* Empty State */
-        .empty-state {
-            text-align: center;
-            padding: 2rem;
-            color: #666;
+        .loading p {
+            font-size: 1.1rem;
+            font-weight: 500;
         }
 
-        .empty-state i {
-            font-size: 3rem;
-            color: #ddd;
-            margin-bottom: 1rem;
+        /* Fade out animation for removed items */
+        .fade-out {
+            opacity: 0 !important;
+            transform: translateX(-100%) scale(0.8) !important;
+            transition: all 0.4s ease !important;
         }
 
-        .empty-state h4 {
-            font-size: 1.2rem;
-            margin-bottom: 0.5rem;
-        }
-
-        /* Mobile Responsive */
+        /* Responsive */
         @media (max-width: 768px) {
-            .nav-links {
-                display: none;
+            .dashboard-container { 
+                padding: 0 1rem; 
+                margin-top: 80px; 
             }
-
-            .welcome-banner h1 {
-                font-size: 2rem;
+            .nav-links { 
+                display: none; 
             }
-
-            .books-grid {
-                grid-template-columns: 1fr;
+            .welcome-section { 
+                flex-direction: column; 
+                text-align: center; 
+                padding: 2rem;
             }
-
-            .quick-actions {
-                grid-template-columns: 1fr;
+            .welcome-text h1 {
+                font-size: 2.2rem;
             }
-
-            .user-stats {
-                grid-template-columns: repeat(2, 1fr);
+            .dashboard-grid { 
+                grid-template-columns: 1fr; 
             }
-
-            .nav-container, .welcome-container, .search-container, .main-content {
-                padding: 0 1rem;
-            }
-
-            .modal-content {
-                width: 95%;
-                margin: 10% auto;
-            }
-
-            .modal-book-info {
-                flex-direction: column;
+            .book-item { 
+                flex-direction: column; 
                 text-align: center;
             }
-
-            .modal-actions {
+            .book-actions {
+                align-items: center;
+                flex-direction: row;
+                justify-content: center;
+                gap: 1rem;
+            }
+            .tabs {
                 flex-direction: column;
+                gap: 0.5rem;
+            }
+            .tab {
+                border-radius: 15px;
+            }
+            .quick-stats {
+                grid-template-columns: repeat(2, 1fr);
             }
         }
     </style>
 </head>
 <body>
-    <!-- Loading Overlay -->
-    <div class="loading-overlay" id="loadingOverlay">
-        <div class="spinner"></div>
-        <p>กำลังดำเนินการ...</p>
-    </div>
-
-    <!-- Reserve Book Modal -->
-    <div id="reserveModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3><i class="fas fa-bookmark"></i> จองหนังสือ</h3>
-                <button class="close" onclick="closeModal('reserveModal')">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="modal-book-info">
-                    <div class="modal-book-cover" id="modal-book-cover">
-                        <i class="fas fa-book"></i>
-                    </div>
-                    <div class="modal-book-details" id="modal-book-details">
-                        <h4 id="modal-book-title">หนังสือ</h4>
-                        <p id="modal-book-author"><i class="fas fa-user"></i> ผู้เขียน</p>
-                        <p id="modal-book-category"><i class="fas fa-tag"></i> หมวดหมู่</p>
-                        <p id="modal-book-isbn"><i class="fas fa-barcode"></i> ISBN</p>
-                    </div>
-                </div>
-                <div class="info-box">
-                    <h4>
-                        <i class="fas fa-info-circle"></i> ขั้นตอนการจองหนังสือ
-                    </h4>
-                    <p>เมื่อคุณกดยืนยัน ระบบจะบันทึกการจองหนังสือไว้ในระบบ</p>
-                    <p>แอดมินจะตรวจสอบและอนุมัติการจองของคุณ</p>
-                    <p>หลังจากอนุมัติแล้ว คุณจะได้รับแจ้งเตือนให้มารับหนังสือ</p>
-                    <p>การจองจะหมดอายุใน 1 วัน หากไม่ได้รับการอนุมัติ</p>
-                    <p>ระยะเวลาการยืมจะเริ่มนับเมื่อแอดมินอนุมัติและส่งมอบหนังสือ</p>
-                </div>
-                <div class="modal-actions">
-                    <button class="btn-modal btn-modal-secondary" onclick="closeModal('reserveModal')">
-                        <i class="fas fa-times"></i> ยกเลิก
-                    </button>
-                    <button class="btn-modal btn-modal-primary" id="confirm-reserve-btn" onclick="confirmReserve()">
-                        <i class="fas fa-bookmark"></i> ยืนยันการจอง
-                    </button>
-                </div>
-            </div>
-        </div>
-    </div>
-
     <!-- Header -->
     <header class="header">
         <nav class="nav-container">
@@ -1037,11 +1187,9 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
                 <span>ห้องสมุดดิจิทัล</span>
             </div>
             <ul class="nav-links">
-                <li><a href="dashboard.php">แดชบอร์ด</a></li>
-                <li><a href="#" class="active">หน้าแรก</a></li>
+                <li><a href="index_user.php">หน้าแรก</a></li>
+                <li><a href="dashboard.php" class="active">แดชบอร์ด</a></li>
                 <li><a href="profile.php">โปรไฟล์</a></li>
-                <li><a href="history.php">ประวัติการยืม</a></li>
-                <li><a href="search.php">ค้นหาหนังสือ</a></li>
             </ul>
             <div class="user-menu">
                 <a href="../logout.php" class="btn-logout">
@@ -1052,493 +1200,853 @@ $max_borrow_days = (int)($settings['max_borrow_days'] ?? 14);
         </nav>
     </header>
 
-    <!-- Welcome Banner -->
-    <section class="welcome-banner">
-        <div class="welcome-container">
-            <h1>สวัสดี, <?php echo htmlspecialchars($user['first_name'] . ' ' . $user['last_name']); ?>!</h1>
-            <p>ยินดีต้อนรับสู่ห้องสมุดดิจิทัล วิทยาลัยเทคนิคหาดใหญ่</p>
-            
-            <div class="user-stats">
-                <div class="user-stat-card">
-                    <i class="fas fa-book-reader"></i>
-                    <div class="user-stat-number"><?php echo $user_borrowed_count; ?>/<?php echo $max_borrow_books; ?></div>
-                    <div class="user-stat-label">กำลังยืมอยู่</div>
-                </div>
-                <div class="user-stat-card">
-                    <i class="fas fa-bookmark"></i>
-                    <div class="user-stat-number" id="user-reservations-count">
-                        <?php 
-                        $stmt = $pdo->prepare("SELECT COUNT(*) FROM reservations WHERE user_id = ? AND status = 'active'");
-                        $stmt->execute([$user_id]);
-                        $user_reservations = $stmt->fetchColumn();
-                        echo $user_reservations;
-                        ?>
-                    </div>
-                    <div class="user-stat-label">กำลังจองอยู่</div>
-                </div>
-                <div class="user-stat-card">
-                    <i class="fas fa-history"></i>
-                    <div class="user-stat-number"><?php echo $user_total_borrowed; ?></div>
-                    <div class="user-stat-label">ยืมทั้งหมด</div>
-                </div>
-                <div class="user-stat-card">
-                    <i class="fas fa-calendar-day"></i>
-                    <div class="user-stat-number"><?php echo $max_borrow_days; ?></div>
-                    <div class="user-stat-label">วันที่อนุญาตให้ยืม</div>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Search Section -->
-    <section class="search-section">
-        <div class="search-container">
-            <h2><i class="fas fa-search"></i> ค้นหาหนังสือ</h2>
-            
-            <form class="search-form" method="GET" action="" id="searchForm">
-                <input type="text" name="search" class="search-input" id="searchInput"
-                       placeholder="ค้นหาหนังสือ ผู้เขียน หรือ ISBN..." 
-                       value="<?php echo htmlspecialchars($search); ?>"
-                       autocomplete="off">
-                <button type="submit" class="search-btn">
-                    <i class="fas fa-search"></i>
-                </button>
-            </form>
-
-            <div class="category-filters">
-                <a href="?" class="category-btn <?php echo $category_id == 0 ? 'active' : ''; ?>">
-                    ทั้งหมด
-                </a>
-                <?php foreach ($categories as $category): ?>
-                    <a href="?category=<?php echo $category['category_id']; ?><?php echo $search ? '&search=' . urlencode($search) : ''; ?>" 
-                       class="category-btn <?php echo $category_id == $category['category_id'] ? 'active' : ''; ?>">
-                        <?php echo htmlspecialchars($category['category_name']); ?>
-                    </a>
-                <?php endforeach; ?>
-            </div>
-        </div>
-    </section>
-
     <!-- Main Content -->
-    <div class="main-content">
-        <!-- Quick Actions -->
-        <div class="quick-actions">
-            <a href="dashboard.php" class="quick-action">
-                <i class="fas fa-tachometer-alt"></i>
-                <h4>แดชบอร์ด</h4>
-                <p>ดูสถานะการยืมและข้อมูลส่วนตัว</p>
-            </a>
-            <a href="search.php" class="quick-action">
-                <i class="fas fa-search-plus"></i>
-                <h4>ค้นหาขั้นสูง</h4>
-                <p>ค้นหาหนังสือด้วยตัวกรองหลากหลาย</p>
-            </a>
-            <a href="history.php" class="quick-action">
-                <i class="fas fa-history"></i>
-                <h4>ประวัติการยืม</h4>
-                <p>ดูประวัติการยืมและคืนหนังสือ</p>
-            </a>
-            <a href="profile.php" class="quick-action">
-                <i class="fas fa-user-cog"></i>
-                <h4>แก้ไขโปรไฟล์</h4>
-                <p>จัดการข้อมูลส่วนตัวและการตั้งค่า</p>
-            </a>
+    <div class="dashboard-container">
+        <!-- Welcome Section -->
+        <section class="welcome-section">
+            <div class="profile-img">
+                <?php if (!empty($user['profile_image']) && file_exists('../' . $user['profile_image'])): ?>
+                    <img src="../<?php echo htmlspecialchars($user['profile_image']); ?>" alt="Profile" style="width: 100%; height: 100%; border-radius: 50%; object-fit: cover;">
+                <?php else: ?>
+                    <i class="fas fa-user"></i>
+                <?php endif; ?>
+            </div>
+            <div class="welcome-text">
+                <h1>ยินดีต้อนรับ, <?php echo htmlspecialchars($user['first_name'] . ' ' . $user['last_name']); ?></h1>
+                <p>รหัสนักเรียน: <?php echo htmlspecialchars($user['student_id']); ?> | แผนก: <?php echo htmlspecialchars($user['department'] ?: 'ไม่ระบุ'); ?></p>
+                <p>เวลา: <span id="current-time"></span> | สมาชิกตั้งแต่: <?php echo date('d/m/Y', strtotime($user['created_at'])); ?></p>
+            </div>
+        </section>
+
+        <!-- Quick Stats -->
+        <div class="quick-stats">
+            <div class="stat-card borrowed">
+                <i class="fas fa-book-reader"></i>
+                <div class="stat-number" id="borrowed-count"><?php echo count(array_filter($current_borrows, fn($b) => $b['status'] === 'borrowed')); ?></div>
+                <div class="stat-label">กำลังยืมอยู่</div>
+            </div>
+            <div class="stat-card pending">
+                <i class="fas fa-clock"></i>
+                <div class="stat-number" id="pending-count"><?php echo $stats['pending_return_count']; ?></div>
+                <div class="stat-label">รอยืนยันการคืน</div>
+            </div>
+            <div class="stat-card reserved">
+                <i class="fas fa-bookmark"></i>
+                <div class="stat-number" id="reserved-count"><?php echo count($current_reservations); ?></div>
+                <div class="stat-label">กำลังจองอยู่</div>
+            </div>
+            <div class="stat-card returned">
+                <i class="fas fa-check-circle"></i>
+                <div class="stat-number"><?php echo $stats['total_returned']; ?></div>
+                <div class="stat-label">คืนแล้ว</div>
+            </div>
+            <div class="stat-card overdue">
+                <i class="fas fa-exclamation-triangle"></i>
+                <div class="stat-number"><?php echo $stats['overdue_count']; ?></div>
+                <div class="stat-label">เกินกำหนด</div>
+            </div>
         </div>
 
-        <!-- Content Wrapper -->
-        <div class="content-wrapper">
+        <!-- Dashboard Grid -->
+        <div class="dashboard-grid">
             <!-- Books Section -->
-            <div class="section">
-                <div class="section-header">
-                    <i class="fas fa-book"></i>
-                    <h3>
-                        <?php 
-                        if (!empty($search) || $category_id > 0) {
-                            echo "ผลการค้นหา (" . number_format($total_books) . " เล่ม)";
-                        } else {
-                            echo "หนังสือทั้งหมด";
-                        }
-                        ?>
-                    </h3>
+            <div class="card">
+                <div class="tabs">
+                    <button class="tab active" onclick="showTab('borrowed')">
+                        <i class="fas fa-book-reader"></i> 
+                        <span>หนังสือที่ยืม</span>
+                        <span class="tab-badge" id="borrowed-tab-count"><?php echo count(array_filter($current_borrows, fn($b) => $b['status'] === 'borrowed')); ?></span>
+                    </button>
+                    <button class="tab" onclick="showTab('pending')">
+                        <i class="fas fa-hourglass-half"></i> 
+                        <span>รอคืน</span>
+                        <span class="tab-badge" id="pending-tab-count"><?php echo $stats['pending_return_count']; ?></span>
+                    </button>
+                    <button class="tab" onclick="showTab('reservations')">
+                        <i class="fas fa-bookmark"></i> 
+                        <span>การจอง</span>
+                        <span class="tab-badge" id="reservations-tab-count"><?php echo count($current_reservations); ?></span>
+                    </button>
                 </div>
 
-                <?php if (empty($books)): ?>
-                    <div class="empty-state">
-                        <i class="fas fa-search"></i>
-                        <h4>ไม่พบหนังสือที่ค้นหา</h4>
-                        <p>ลองใช้คำค้นหาอื่น หรือเลือกหมวดหมู่ที่แตกต่างกัน</p>
-                    </div>
-                <?php else: ?>
-                    <div class="books-grid">
-                        <?php 
-                        $display_books = !empty($search) || $category_id > 0 ? $books : $recommended_books;
-                        foreach ($display_books as $book): 
-                            // Check if user already borrowed this book
-                            $stmt = $pdo->prepare("SELECT COUNT(*) FROM borrowing WHERE user_id = ? AND book_id = ? AND status IN ('borrowed', 'overdue')");
-                            $stmt->execute([$user_id, $book['book_id']]);
-                            $already_borrowed = $stmt->fetchColumn() > 0;
-
-                            // Check if user already reserved this book
-                            $stmt = $pdo->prepare("SELECT COUNT(*) FROM reservations WHERE user_id = ? AND book_id = ? AND status = 'active'");
-                            $stmt->execute([$user_id, $book['book_id']]);
-                            $already_reserved = $stmt->fetchColumn() > 0;
-
-                            // Check if book is reserved by someone else
-                            $stmt = $pdo->prepare("SELECT COUNT(*) FROM reservations WHERE book_id = ? AND status = 'active'");
-                            $stmt->execute([$book['book_id']]);
-                            $book_reserved_by_others = $stmt->fetchColumn() > 0 && !$already_reserved;
-                        ?>
-                            <div class="book-card" data-book-id="<?php echo $book['book_id']; ?>">
-                                <div class="book-image">
-                                    <div class="book-availability">
-                                        <?php echo $book['available_copies']; ?>/<?php echo $book['total_copies']; ?> เล่ม
-                                    </div>
-                                    <?php if (!empty($book['cover_url'])): ?>
-                                        <img src="<?php echo htmlspecialchars($book['cover_url']); ?>" 
-                                             alt="<?php echo htmlspecialchars($book['title']); ?>"
-                                             onerror="this.style.display='none';">
+                <!-- Borrowed Books Content -->
+                <div id="borrowed-content" class="tab-content active">
+                    <?php 
+                    $borrowed_books = array_filter($current_borrows, fn($b) => $b['status'] === 'borrowed');
+                    if (count($borrowed_books) > 0): ?>
+                        <?php foreach ($borrowed_books as $borrow): ?>
+                            <div class="book-item" data-borrow-id="<?php echo $borrow['borrow_id']; ?>">
+                                <div class="book-cover">
+                                    <?php if (!empty($borrow['cover_image']) && file_exists('../' . $borrow['cover_image'])): ?>
+                                        <img src="../<?php echo htmlspecialchars($borrow['cover_image']); ?>" alt="Book cover" style="width: 100%; height: 100%; border-radius: 12px; object-fit: cover;">
                                     <?php else: ?>
                                         <i class="fas fa-book"></i>
                                     <?php endif; ?>
                                 </div>
-                                
-                                <div class="book-info">
-                                    <h3 class="book-title" title="<?php echo htmlspecialchars($book['title']); ?>">
-                                        <?php echo htmlspecialchars($book['title']); ?>
-                                    </h3>
-                                    
-                                    <div class="book-author">
-                                        <i class="fas fa-user"></i>
-                                        <?php echo htmlspecialchars($book['authors'] ?: 'ไม่ระบุผู้เขียน'); ?>
-                                    </div>
+                                <div class="book-details">
+                                    <h4><?php echo htmlspecialchars($borrow['title']); ?></h4>
+                                    <p><i class="fas fa-user"></i> <?php echo htmlspecialchars($borrow['author_name'] ?: 'ไม่ระบุผู้เขียน'); ?></p>
+                                    <p><i class="fas fa-tag"></i> <?php echo htmlspecialchars($borrow['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?></p>
+                                    <p><i class="fas fa-calendar"></i> ยืมเมื่อ: <?php echo date('d/m/Y', strtotime($borrow['borrow_date'])); ?></p>
+                                    <p><i class="fas fa-calendar-alt"></i> กำหนดคืน: <?php echo date('d/m/Y', strtotime($borrow['due_date'])); ?></p>
+                                </div>
+                                <div class="book-actions">
+                                    <span class="due-date <?php 
+                                        echo $borrow['days_remaining'] < 0 ? 'overdue' : 
+                                             ($borrow['days_remaining'] <= 3 ? 'due-soon' : 'normal'); 
+                                    ?>">
+                                        <?php 
+                                        if ($borrow['days_remaining'] < 0) {
+                                            echo '<i class="fas fa-exclamation-triangle"></i> เกินกำหนด ' . abs($borrow['days_remaining']) . ' วัน';
+                                        } elseif ($borrow['days_remaining'] == 0) {
+                                            echo '<i class="fas fa-calendar-day"></i> ครบกำหนดวันนี้';
+                                        } else {
+                                            echo '<i class="fas fa-calendar-check"></i> เหลือ ' . $borrow['days_remaining'] . ' วัน';
+                                        }
+                                        ?>
+                                    </span>
+                                    <button class="btn-return" onclick="showReturnModal(<?php echo $borrow['borrow_id']; ?>, '<?php echo htmlspecialchars($borrow['title']); ?>', '<?php echo htmlspecialchars($borrow['author_name'] ?: 'ไม่ระบุผู้เขียน'); ?>', '<?php echo date('d/m/Y', strtotime($borrow['borrow_date'])); ?>', '<?php echo date('d/m/Y', strtotime($borrow['due_date'])); ?>', '<?php echo htmlspecialchars($borrow['cover_image']); ?>')">
+                                        <i class="fas fa-undo"></i> แจ้งคืน
+                                    </button>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <div class="empty-state">
+                            <i class="fas fa-book-open"></i>
+                            <h4>ไม่มีหนังสือที่กำลังยืมอยู่</h4>
+                            <p>ไปค้นหาและยืมหนังสือที่สนใจได้เลย!</p>
+                        </div>
+                    <?php endif; ?>
+                </div>
 
-                                    <?php if (!empty($book['isbn'])): ?>
-                                    <div class="book-isbn">
-                                        <i class="fas fa-barcode"></i>
-                                        <?php echo htmlspecialchars($book['isbn']); ?>
-                                    </div>
+                <!-- Pending Return Books Content -->
+                <div id="pending-content" class="tab-content">
+                    <?php 
+                    $pending_books = array_filter($current_borrows, fn($b) => $b['status'] === 'pending_return');
+                    if (count($pending_books) > 0): ?>
+                        <?php foreach ($pending_books as $borrow): ?>
+                            <div class="book-item" data-borrow-id="<?php echo $borrow['borrow_id']; ?>">
+                                <div class="book-cover">
+                                    <?php if (!empty($borrow['cover_image']) && file_exists('../' . $borrow['cover_image'])): ?>
+                                        <img src="../<?php echo htmlspecialchars($borrow['cover_image']); ?>" alt="Book cover" style="width: 100%; height: 100%; border-radius: 12px; object-fit: cover;">
+                                    <?php else: ?>
+                                        <i class="fas fa-book"></i>
                                     <?php endif; ?>
-                                    
-                                    <div class="book-category">
-                                        <?php echo htmlspecialchars($book['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?>
-                                    </div>
-                                    
-                                    <div class="book-actions">
-                                        <?php if ($already_borrowed): ?>
-                                            <button class="btn-reserve reserved" disabled>
-                                                <i class="fas fa-check"></i>
-                                                ยืมอยู่
-                                            </button>
-                                        <?php elseif ($already_reserved): ?>
-                                            <button class="btn-reserve reserved" disabled>
-                                                <i class="fas fa-bookmark"></i>
-                                                จองแล้ว
-                                            </button>
-                                        <?php elseif ($user_borrowed_count >= $max_borrow_books): ?>
-                                            <button class="btn-reserve" disabled title="ยืมครบจำนวนสูงสุดแล้ว">
-                                                <i class="fas fa-ban"></i>
-                                                ยืมครบแล้ว
-                                            </button>
-                                        <?php elseif ($book_reserved_by_others): ?>
-                                            <button class="btn-reserve" disabled title="หนังสือถูกจองแล้ว">
-                                                <i class="fas fa-bookmark"></i>
-                                                ถูกจองแล้ว
-                                            </button>
-                                        <?php elseif ($book['available_copies'] <= 0): ?>
-                                            <button class="btn-reserve" disabled>
-                                                <i class="fas fa-times"></i>
-                                                ไม่ว่าง
-                                            </button>
+                                </div>
+                                <div class="book-details">
+                                    <h4><?php echo htmlspecialchars($borrow['title']); ?></h4>
+                                    <p><i class="fas fa-user"></i> <?php echo htmlspecialchars($borrow['author_name'] ?: 'ไม่ระบุผู้เขียน'); ?></p>
+                                    <p><i class="fas fa-tag"></i> <?php echo htmlspecialchars($borrow['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?></p>
+                                    <p><i class="fas fa-calendar"></i> ยืมเมื่อ: <?php echo date('d/m/Y', strtotime($borrow['borrow_date'])); ?></p>
+                                    <p><i class="fas fa-calendar-alt"></i> กำหนดคืน: <?php echo date('d/m/Y', strtotime($borrow['due_date'])); ?></p>
+                                </div>
+                                <div class="book-actions">
+                                    <span class="due-date pending-return">
+                                        <i class="fas fa-clock"></i> รอแอดมินยืนยัน
+                                    </span>
+                                    <button class="btn-pending" disabled>
+                                        <i class="fas fa-hourglass-half"></i> รอยืนยัน
+                                    </button>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <div class="empty-state">
+                            <i class="fas fa-hourglass-half"></i>
+                            <h4>ไม่มีหนังสือที่รอยืนยันการคืน</h4>
+                            <p>หนังสือที่คุณแจ้งคืนจะแสดงในหน้านี้</p>
+                        </div>
+                    <?php endif; ?>
+                </div>
+
+                <!-- Reservations Content -->
+                <div id="reservations-content" class="tab-content">
+                    <?php if (count($current_reservations) > 0): ?>
+                        <?php foreach ($current_reservations as $reservation): ?>
+                            <div class="book-item" data-reservation-id="<?php echo $reservation['reservation_id']; ?>">
+                                <div class="book-cover">
+                                    <?php if (!empty($reservation['cover_image']) && file_exists('../' . $reservation['cover_image'])): ?>
+                                        <img src="../<?php echo htmlspecialchars($reservation['cover_image']); ?>" alt="Book cover" style="width: 100%; height: 100%; border-radius: 12px; object-fit: cover;">
+                                    <?php else: ?>
+                                        <i class="fas fa-book"></i>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="book-details">
+                                    <h4><?php echo htmlspecialchars($reservation['title']); ?></h4>
+                                    <p><i class="fas fa-tag"></i> <?php echo htmlspecialchars($reservation['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?></p>
+                                    <p><i class="fas fa-calendar-plus"></i> จองเมื่อ: <?php echo date('d/m/Y H:i', strtotime($reservation['reservation_date'])); ?></p>
+                                    <p><i class="fas fa-calendar-times"></i> หมดอายุ: <?php echo date('d/m/Y H:i', strtotime($reservation['expiry_date'])); ?></p>
+                                    <?php
+                                    $now = new DateTime();
+                                    $expiry = new DateTime($reservation['expiry_date']);
+                                    $hours_remaining = $expiry > $now ? 
+                                        (int)$now->diff($expiry)->format('%a') * 24 + (int)$now->diff($expiry)->format('%h') : 0;
+                                    ?>
+                                    <p><i class="fas fa-hourglass-half"></i> 
+                                        <?php if ($hours_remaining > 0): ?>
+                                            เหลือเวลา: <?php echo $hours_remaining; ?> ชั่วโมง
                                         <?php else: ?>
-                                            <button class="btn-reserve" onclick="showReserveModal(<?php echo $book['book_id']; ?>, '<?php echo addslashes($book['title']); ?>', '<?php echo addslashes($book['authors'] ?: 'ไม่ระบุผู้เขียน'); ?>', '<?php echo addslashes($book['category_name'] ?: 'ไม่ระบุหมวดหมู่'); ?>', '<?php echo addslashes($book['isbn'] ?: 'ไม่ระบุ ISBN'); ?>')">
-                                                <i class="fas fa-bookmark"></i>
-                                                จองหนังสือ
-                                            </button>
+                                            <span style="color: #dc3545;">หมดอายุแล้ว</span>
                                         <?php endif; ?>
+                                    </p>
+                                </div>
+                                <div class="book-actions">
+                                    <span class="due-date reserved-status">
+                                        <i class="fas fa-bookmark"></i> รอแอดมินอนุมัติ
+                                    </span>
+                                    <?php if ($hours_remaining > 0): ?>
+                                        <button class="btn-cancel" onclick="showCancelReservationModal(<?php echo $reservation['reservation_id']; ?>, '<?php echo htmlspecialchars($reservation['title']); ?>', '<?php echo htmlspecialchars($reservation['cover_image']); ?>')">
+                                            <i class="fas fa-times"></i> ยกเลิกการจอง
+                                        </button>
+                                    <?php else: ?>
+                                        <button class="btn-pending" disabled>
+                                            <i class="fas fa-clock"></i> หมดอายุแล้ว
+                                        </button>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <div class="empty-state">
+                            <i class="fas fa-bookmark"></i>
+                            <h4>ไม่มีการจองหนังสือ</h4>
+                            <p>คุณสามารถจองหนังสือที่ต้องการได้จากหน้าค้นหา</p>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <!-- Notifications -->
+            <div class="card">
+                <div class="card-header">
+                    <i class="fas fa-bell"></i>
+                    <h3>การแจ้งเตือน</h3>
+                </div>
+                <div class="card-content" id="notifications-container">
+                    <?php if (count($notifications) > 0): ?>
+                        <?php foreach ($notifications as $notification): ?>
+                            <div class="notification-item">
+                                <div class="notification-icon <?php 
+                                    echo match($notification['type'] ?? 'info') {
+                                        'overdue' => 'warning',
+                                        'returned' => 'success',
+                                        'reserved' => 'info',
+                                        'reservation_cancelled' => 'warning',
+                                        default => 'info'
+                                    };
+                                ?>">
+                                    <i class="fas fa-<?php 
+                                        echo match($notification['type'] ?? 'info') {
+                                            'overdue' => 'exclamation-triangle',
+                                            'returned' => 'check-circle',
+                                            'reserved' => 'bookmark',
+                                            'reservation_cancelled' => 'times-circle',
+                                            default => 'info-circle'
+                                        };
+                                    ?>"></i>
+                                </div>
+                                <div class="notification-content">
+                                    <h4><?php echo htmlspecialchars($notification['title']); ?></h4>
+                                    <p><?php echo htmlspecialchars($notification['message']); ?></p>
+                                    <div class="notification-time">
+                                        <i class="fas fa-clock"></i>
+                                        <?php echo date('d/m/Y H:i', strtotime($notification['sent_date'])); ?>
                                     </div>
                                 </div>
                             </div>
                         <?php endforeach; ?>
-                    </div>
-
-                    <!-- Pagination (only show if searching) -->
-                    <?php if ((!empty($search) || $category_id > 0) && $total_pages > 1): ?>
-                        <div class="pagination">
-                            <?php
-                            $query_params = [];
-                            if (!empty($search)) $query_params['search'] = $search;
-                            if ($category_id > 0) $query_params['category'] = $category_id;
-                            
-                            // Previous page
-                            if ($page > 1) {
-                                $query_params['page'] = $page - 1;
-                                $url = '?' . http_build_query($query_params);
-                                echo '<a href="' . $url . '"><i class="fas fa-chevron-left"></i></a>';
-                            }
-                            
-                            // Page numbers
-                            $start_page = max(1, $page - 2);
-                            $end_page = min($total_pages, $page + 2);
-                            
-                            for ($i = $start_page; $i <= $end_page; $i++):
-                                $query_params['page'] = $i;
-                                $url = '?' . http_build_query($query_params);
-                            ?>
-                                <?php if ($i == $page): ?>
-                                    <span class="current"><?php echo $i; ?></span>
-                                <?php else: ?>
-                                    <a href="<?php echo $url; ?>"><?php echo $i; ?></a>
-                                <?php endif; ?>
-                            <?php endfor; ?>
-                            
-                            <?php
-                            // Next page
-                            if ($page < $total_pages) {
-                                $query_params['page'] = $page + 1;
-                                $url = '?' . http_build_query($query_params);
-                                echo '<a href="' . $url . '"><i class="fas fa-chevron-right"></i></a>';
-                            }
-                            ?>
+                    <?php else: ?>
+                        <div class="empty-state">
+                            <i class="fas fa-bell-slash"></i>
+                            <h4>ไม่มีการแจ้งเตือนใหม่</h4>
+                            <p>คุณไม่มีการแจ้งเตือนที่ยังไม่ได้อ่าน</p>
                         </div>
                     <?php endif; ?>
-                <?php endif; ?>
+                </div>
             </div>
         </div>
     </div>
 
-    <script>
-        // ========================
-        // CORE SYSTEM VARIABLES
-        // ========================
-        let isProcessing = false;
-        let currentBookId = null;
+    <!-- Return Modal -->
+    <div id="returnModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-undo"></i> แจ้งคืนหนังสือ</h3>
+                <button class="close" onclick="closeModal('returnModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-book-info">
+                    <div class="modal-book-cover" id="modal-book-cover">
+                        <i class="fas fa-book"></i>
+                    </div>
+                    <div class="modal-book-details" id="modal-book-details">
+                        <h4 id="modal-book-title">หนังสือ</h4>
+                        <p id="modal-book-author"><i class="fas fa-user"></i> ผู้เขียน</p>
+                        <p id="modal-borrow-date"><i class="fas fa-calendar"></i> ยืมเมื่อ: </p>
+                        <p id="modal-due-date"><i class="fas fa-calendar-alt"></i> กำหนดคืน: </p>
+                    </div>
+                </div>
+                
+                <div class="info-box">
+                    <h4><i class="fas fa-info-circle"></i> การแจ้งคืน</h4>
+                    <p>เมื่อคุณกดยืนยัน ระบบจะส่งคำขอคืนหนังสือไปยังแอดมิน</p>
+                    <p>แอดมินจะตรวจสอบสภาพหนังสือและยืนยันการคืน</p>
+                    <p>สถานะจะเปลี่ยนเป็น "รอแอดมินยืนยัน" จนกว่าจะได้รับการอนุมัติ</p>
+                </div>
 
-        // ========================
-        // NOTIFICATION SYSTEM
-        // ========================
-        function showNotification(message, type = 'success') {
-            // Remove existing notifications
-            document.querySelectorAll('.notification').forEach(n => n.remove());
+                <div class="modal-actions">
+                    <button class="btn-modal btn-modal-secondary" onclick="closeModal('returnModal')">
+                        <i class="fas fa-times"></i> ยกเลิก
+                    </button>
+                    <button class="btn-modal btn-modal-primary" onclick="confirmReturn()">
+                        <i class="fas fa-undo"></i> ยืนยันแจ้งคืน
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Cancel Reservation Modal -->
+    <div id="cancelReservationModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-times-circle"></i> ยกเลิกการจองหนังสือ</h3>
+                <button class="close" onclick="closeModal('cancelReservationModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-book-info">
+                    <div class="modal-book-cover" id="cancel-modal-book-cover">
+                        <i class="fas fa-book"></i>
+                    </div>
+                    <div class="modal-book-details">
+                        <h4 id="cancel-modal-book-title">หนังสือ</h4>
+                        <p><i class="fas fa-bookmark"></i> การจองนี้จะถูกยกเลิก</p>
+                    </div>
+                </div>
+                
+                <div class="info-box warning-box">
+                    <h4><i class="fas fa-exclamation-triangle"></i> คำเตือน</h4>
+                    <p><strong>การยกเลิกการจองไม่สามารถยกเลิกได้</strong> หากต้องการหนังสือเล่มนี้ คุณจะต้องจองใหม่อีกครั้ง</p>
+                </div>
+
+                <div class="modal-actions">
+                    <button class="btn-modal btn-modal-secondary" onclick="closeModal('cancelReservationModal')">
+                        <i class="fas fa-arrow-left"></i> กลับ
+                    </button>
+                    <button class="btn-modal btn-modal-danger" onclick="confirmCancelReservation()">
+                        <i class="fas fa-times"></i> ยืนยันยกเลิก
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading" id="loadingOverlay">
+        <div class="loading-content">
+            <div class="spinner"></div>
+            <p>กำลังดำเนินการ...</p>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let currentBorrowId = null;
+        let currentReservationId = null;
+        let activeTab = 'borrowed';
+
+        // Initialize dashboard
+        document.addEventListener('DOMContentLoaded', function() {
+            updateTime();
+            setInterval(updateTime, 1000);
+            initializeEventListeners();
+            console.log('%cห้องสมุดดิจิทัล - Enhanced Dashboard Loaded', 'color: #667eea; font-size: 16px; font-weight: bold;');
+        });
+
+        // Enhanced tab switching with active tab tracking
+        function showTab(tabName) {
+            activeTab = tabName;
+            
+            // Remove active from all
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            
+            // Add active to selected
+            document.getElementById(tabName + '-content').classList.add('active');
+            event.target.classList.add('active');
+        }
+
+        // Modal functions
+        function showReturnModal(borrowId, title, author, borrowDate, dueDate, coverImage) {
+            currentBorrowId = borrowId;
+            
+            document.getElementById('modal-book-title').textContent = title;
+            document.getElementById('modal-book-author').innerHTML = '<i class="fas fa-user"></i> ' + author;
+            document.getElementById('modal-borrow-date').innerHTML = '<i class="fas fa-calendar"></i> ยืมเมื่อ: ' + borrowDate;
+            document.getElementById('modal-due-date').innerHTML = '<i class="fas fa-calendar-alt"></i> กำหนดคืน: ' + dueDate;
+            
+            const coverElement = document.getElementById('modal-book-cover');
+            if (coverImage && coverImage !== '') {
+                coverElement.innerHTML = `<img src="../${coverImage}" alt="Book cover" style="width: 100%; height: 100%; border-radius: 12px; object-fit: cover;">`;
+            } else {
+                coverElement.innerHTML = '<i class="fas fa-book"></i>';
+            }
+            
+            document.getElementById('returnModal').style.display = 'block';
+        }
+
+        function showCancelReservationModal(reservationId, title, coverImage) {
+            currentReservationId = reservationId;
+            
+            document.getElementById('cancel-modal-book-title').textContent = title;
+            
+            const coverElement = document.getElementById('cancel-modal-book-cover');
+            if (coverImage && coverImage !== '') {
+                coverElement.innerHTML = `<img src="../${coverImage}" alt="Book cover" style="width: 100%; height: 100%; border-radius: 12px; object-fit: cover;">`;
+            } else {
+                coverElement.innerHTML = '<i class="fas fa-book"></i>';
+            }
+            
+            document.getElementById('cancelReservationModal').style.display = 'block';
+        }
+
+        function closeModal(modalId) {
+            document.getElementById(modalId).style.display = 'none';
+            currentBorrowId = null;
+            currentReservationId = null;
+        }
+
+        // Enhanced notification system
+        function showNotification(message, type = 'success', duration = 6000) {
+            // Remove existing notifications first
+            const existingToasts = document.querySelectorAll('.notification-toast');
+            existingToasts.forEach(toast => {
+                toast.style.transform = 'translateX(120%)';
+                setTimeout(() => toast.remove(), 300);
+            });
 
             const notification = document.createElement('div');
-            notification.className = `notification ${type}`;
+            notification.className = `notification-toast ${type}`;
             
-            const icon = {
-                'success': 'check-circle',
-                'error': 'exclamation-triangle', 
-                'warning': 'exclamation-circle'
-            }[type] || 'info-circle';
+            // Set background based on type
+            const backgrounds = {
+                success: 'linear-gradient(135deg, #28a745, #20c997)',
+                error: 'linear-gradient(135deg, #dc3545, #e55353)',
+                warning: 'linear-gradient(135deg, #ffc107, #ffca2c)',
+                info: 'linear-gradient(135deg, #17a2b8, #20c997)'
+            };
             
-            notification.innerHTML = `<i class="fas fa-${icon}"></i><span>${message}</span>`;
+            const icons = {
+                success: 'check-circle',
+                error: 'times-circle',
+                warning: 'exclamation-triangle',
+                info: 'info-circle'
+            };
+            
+            notification.style.background = backgrounds[type] || backgrounds.success;
+            
+            notification.innerHTML = `
+                <i class="fas fa-${icons[type] || icons.success}"></i>
+                <span style="flex: 1;">${message}</span>
+                <button class="close-btn" onclick="this.parentElement.remove()">
+                    <i class="fas fa-times"></i>
+                </button>
+            `;
+            
             document.body.appendChild(notification);
             
-            // Show with animation
-            setTimeout(() => notification.classList.add('show'), 100);
+            // Trigger animation
+            setTimeout(() => {
+                notification.classList.add('show');
+            }, 100);
             
-            // Auto hide after 5 seconds
-            setTimeout(() => hideNotification(notification), 5000);
+            // Auto remove after duration
+            setTimeout(() => {
+                notification.classList.remove('show');
+                setTimeout(() => {
+                    if (notification.parentNode) {
+                        notification.remove();
+                    }
+                }, 400);
+            }, duration);
+            
+            return notification;
         }
 
-        function hideNotification(notification) {
-            notification.classList.remove('show');
-            setTimeout(() => notification.remove(), 300);
-        }
-
-        // ========================
-        // LOADING SYSTEM
-        // ========================
+        // Enhanced loading overlay
         function showLoading(message = 'กำลังดำเนินการ...') {
             const loadingOverlay = document.getElementById('loadingOverlay');
-            if (loadingOverlay) {
-                const loadingText = loadingOverlay.querySelector('p');
-                if (loadingText) loadingText.textContent = message;
-                loadingOverlay.classList.add('show');
+            const loadingText = loadingOverlay.querySelector('p');
+            if (loadingText) {
+                loadingText.textContent = message;
             }
+            loadingOverlay.style.display = 'flex';
         }
 
         function hideLoading() {
             const loadingOverlay = document.getElementById('loadingOverlay');
-            if (loadingOverlay) loadingOverlay.classList.remove('show');
+            loadingOverlay.style.display = 'none';
         }
 
-        // ========================
-        // MODAL SYSTEM
-        // ========================
-        function showReserveModal(bookId, title, author, category, isbn) {
-            currentBookId = bookId;
-            
-            // Update modal content
-            const elements = {
-                'modal-book-title': title,
-                'modal-book-author': `<i class="fas fa-user"></i> ${author}`,
-                'modal-book-category': `<i class="fas fa-tag"></i> ${category}`,
-                'modal-book-isbn': `<i class="fas fa-barcode"></i> ${isbn}`
+        // Enhanced function to update counts immediately
+        function updateCounts(type, change) {
+            const countElements = {
+                'borrowed': ['borrowed-count', 'borrowed-tab-count'],
+                'pending': ['pending-count', 'pending-tab-count'],
+                'reserved': ['reserved-count', 'reservations-tab-count']
             };
             
-            Object.entries(elements).forEach(([id, content]) => {
-                const element = document.getElementById(id);
-                if (element) element.innerHTML = content;
+            if (countElements[type]) {
+                countElements[type].forEach(id => {
+                    const element = document.getElementById(id);
+                    if (element) {
+                        const currentCount = parseInt(element.textContent) || 0;
+                        const newCount = Math.max(0, currentCount + change);
+                        element.textContent = newCount;
+                        
+                        // Add pulse animation for visual feedback
+                        element.style.transform = 'scale(1.2)';
+                        element.style.transition = 'transform 0.3s ease';
+                        setTimeout(() => {
+                            element.style.transform = 'scale(1)';
+                        }, 300);
+                    }
+                });
+            }
+        }
+
+        // Enhanced function to remove item from UI immediately
+        function removeBookItem(borrowId, reservationId = null, type = 'borrow') {
+            const selector = type === 'borrow' 
+                ? `[data-borrow-id="${borrowId}"]`
+                : `[data-reservation-id="${reservationId}"]`;
+            
+            const bookItem = document.querySelector(selector);
+            
+            if (bookItem) {
+                // Add fade out animation
+                bookItem.classList.add('fade-out');
+                
+                // Remove from DOM after animation
+                setTimeout(() => {
+                    bookItem.remove();
+                    
+                    // Check if the current tab is now empty and show empty state
+                    const activeTabContent = document.querySelector('.tab-content.active');
+                    const remainingItems = activeTabContent.querySelectorAll('.book-item');
+                    
+                    if (remainingItems.length === 0) {
+                        const emptyStateHtml = getEmptyStateForTab(activeTab);
+                        activeTabContent.innerHTML = emptyStateHtml;
+                    }
+                    
+                }, 400);
+                
+                return true;
+            }
+            return false;
+        }
+
+        // Function to get appropriate empty state for each tab
+        function getEmptyStateForTab(tab) {
+            const emptyStates = {
+                'borrowed': `
+                    <div class="empty-state">
+                        <i class="fas fa-book-open"></i>
+                        <h4>ไม่มีหนังสือที่กำลังยืมอยู่</h4>
+                        <p>ไปค้นหาและยืมหนังสือที่สนใจได้เลย!</p>
+                    </div>
+                `,
+                'pending': `
+                    <div class="empty-state">
+                        <i class="fas fa-hourglass-half"></i>
+                        <h4>ไม่มีหนังสือที่รอยืนยันการคืน</h4>
+                        <p>หนังสือที่คุณแจ้งคืนจะแสดงในหน้านี้</p>
+                    </div>
+                `,
+                'reservations': `
+                    <div class="empty-state">
+                        <i class="fas fa-bookmark"></i>
+                        <h4>ไม่มีการจองหนังสือ</h4>
+                        <p>คุณสามารถจองหนังสือที่ต้องการได้จากหน้าค้นหา</p>
+                    </div>
+                `
+            };
+            
+            return emptyStates[tab] || emptyStates['borrowed'];
+        }
+
+        // Add notification to panel for immediate feedback
+        function addNotificationToPanel(notificationData) {
+            const cardContent = document.getElementById('notifications-container');
+            const emptyState = cardContent.querySelector('.empty-state');
+            
+            // Remove empty state if it exists
+            if (emptyState) {
+                emptyState.remove();
+            }
+            
+            // Create notification element
+            const notificationItem = document.createElement('div');
+            notificationItem.className = 'notification-item';
+            notificationItem.style.opacity = '0';
+            notificationItem.style.transform = 'translateX(50px)';
+            notificationItem.style.transition = 'all 0.5s ease';
+            
+            const iconClass = {
+                'return_pending': 'hourglass-half',
+                'reservation_cancelled': 'times-circle',
+                'success': 'check-circle',
+                'info': 'info-circle'
+            };
+            
+            const iconTypeClass = {
+                'return_pending': 'warning',
+                'reservation_cancelled': 'warning',
+                'success': 'success',
+                'info': 'info'
+            };
+            
+            const currentTime = new Date().toLocaleString('th-TH', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit'
             });
             
-            // Show modal
-            const modal = document.getElementById('reserveModal');
-            if (modal) {
-                modal.style.display = 'block';
-                document.body.style.overflow = 'hidden';
-            }
+            notificationItem.innerHTML = `
+                <div class="notification-icon ${iconTypeClass[notificationData.type] || 'info'}">
+                    <i class="fas fa-${iconClass[notificationData.type] || 'info-circle'}"></i>
+                </div>
+                <div class="notification-content">
+                    <h4>${notificationData.title}</h4>
+                    <p>${notificationData.message}</p>
+                    <div class="notification-time">
+                        <i class="fas fa-clock"></i>
+                        ${currentTime}
+                    </div>
+                </div>
+            `;
+            
+            // Add to beginning of notifications
+            cardContent.insertBefore(notificationItem, cardContent.firstChild);
+            
+            // Trigger animation
+            setTimeout(() => {
+                notificationItem.style.opacity = '1';
+                notificationItem.style.transform = 'translateX(0)';
+            }, 100);
         }
 
-        function closeModal(modalId) {
-            const modal = document.getElementById(modalId);
-            if (modal) {
-                modal.style.display = 'none';
-                document.body.style.overflow = 'auto';
+        // Enhanced confirm return with immediate UI updates
+        async function confirmReturn() {
+            if (!currentBorrowId || currentBorrowId <= 0) {
+                showNotification('เกิดข้อผิดพลาด: ไม่พบรหัสการยืม', 'error');
+                return;
             }
-            currentBookId = null;
-        }
-
-        // ========================
-        // BOOK RESERVATION
-        // ========================
-        function confirmReserve() {
-            if (!currentBookId || isProcessing) return;
-
-            isProcessing = true;
-            showLoading('กำลังดำเนินการจองหนังสือ...');
-
-            fetch('reserve_book.php', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest'
-                },
-                body: JSON.stringify({ book_id: currentBookId })
-            })
-            .then(response => response.json())
-            .then(data => {
+            
+            const borrowIdToSend = currentBorrowId;
+            const bookTitle = document.getElementById('modal-book-title').textContent;
+            
+            showLoading('กำลังแจ้งคืนหนังสือ...');
+            closeModal('returnModal');
+            
+            // Immediately update UI
+            const itemRemoved = removeBookItem(borrowIdToSend, null, 'borrow');
+            if (itemRemoved) {
+                updateCounts('borrowed', -1);
+                updateCounts('pending', 1);
+            }
+            
+            try {
+                const response = await fetch('request_return.php', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({ borrow_id: borrowIdToSend })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const contentType = response.headers.get('content-type');
+                if (!contentType || !contentType.includes('application/json')) {
+                    throw new Error('ระบบตอบกลับในรูปแบบที่ไม่ถูกต้อง');
+                }
+                
+                const data = await response.json();
                 hideLoading();
-                isProcessing = false;
                 
                 if (data.success) {
-                    closeModal('reserveModal');
-                    showNotification('จองหนังสือสำเร็จ! รอแอดมินอนุมัติ', 'success');
+                    showNotification(`แจ้งคืนหนังสือ "${bookTitle}" สำเร็จ! รอแอดมินยืนยัน`, 'success', 8000);
                     
-                    // Update UI
-                    updateBookCardAfterReserve(currentBookId);
-                    updateUserStats();
+                    // Add notification to panel
+                    addNotificationToPanel({
+                        type: 'return_pending',
+                        title: 'แจ้งคืนหนังสือ',
+                        message: `คุณได้แจ้งคืนหนังสือ "${bookTitle}" แล้ว รอแอดมินยืนยัน`,
+                        sent_date: new Date().toISOString()
+                    });
                     
-                    // Auto refresh after 3 seconds
-                    setTimeout(() => window.location.reload(), 3000);
                 } else {
-                    showNotification(`ไม่สามารถจองหนังสือได้: ${data.message}`, 'error');
+                    // Revert UI changes on error
+                    showNotification(`เกิดข้อผิดพลาด: ${data.message || 'ไม่สามารถแจ้งคืนได้'}`, 'error', 8000);
+                    setTimeout(() => window.location.reload(), 2000);
                 }
-            })
-            .catch(error => {
+            } catch (error) {
                 hideLoading();
-                isProcessing = false;
-                console.error('Reserve book error:', error);
-                showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่อีกครั้ง', 'error');
-            });
-        }
-
-        function updateBookCardAfterReserve(bookId) {
-            const bookCard = document.querySelector(`[data-book-id="${bookId}"]`);
-            if (bookCard) {
-                const reserveBtn = bookCard.querySelector('.btn-reserve');
-                if (reserveBtn) {
-                    reserveBtn.disabled = true;
-                    reserveBtn.classList.add('reserved');
-                    reserveBtn.innerHTML = '<i class="fas fa-bookmark"></i> จองแล้ว';
-                }
+                console.error('Return error:', error);
+                showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่อีกครั้ง', 'error', 8000);
+                // Revert UI changes on error
+                setTimeout(() => window.location.reload(), 2000);
             }
         }
 
-        function updateUserStats() {
-            const reservationsCount = document.getElementById('user-reservations-count');
-            if (reservationsCount) {
-                const currentCount = parseInt(reservationsCount.textContent) || 0;
-                reservationsCount.textContent = currentCount + 1;
+        // Enhanced confirm cancel reservation with immediate UI updates
+        async function confirmCancelReservation() {
+            if (!currentReservationId || currentReservationId <= 0) {
+                showNotification('เกิดข้อผิดพลาด: ไม่พบรหัสการจอง', 'error');
+                return;
+            }
+            
+            const reservationIdToSend = currentReservationId;
+            const bookTitle = document.getElementById('cancel-modal-book-title').textContent;
+            
+            showLoading('กำลังยกเลิกการจอง...');
+            closeModal('cancelReservationModal');
+            
+            // Immediately update UI
+            const itemRemoved = removeBookItem(null, reservationIdToSend, 'reservation');
+            if (itemRemoved) {
+                updateCounts('reserved', -1);
+            }
+            
+            try {
+                const response = await fetch('cancel_reservation.php', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({ reservation_id: reservationIdToSend })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const contentType = response.headers.get('content-type');
+                if (!contentType || !contentType.includes('application/json')) {
+                    throw new Error('ระบบตอบกลับในรูปแบบที่ไม่ถูกต้อง');
+                }
+                
+                const data = await response.json();
+                hideLoading();
+                
+                if (data.success) {
+                    showNotification(`ยกเลิกการจองหนังสือ "${bookTitle}" เรียบร้อยแล้ว`, 'success', 8000);
+                    
+                    // Add notification to panel
+                    addNotificationToPanel({
+                        type: 'reservation_cancelled',
+                        title: 'ยกเลิกการจอง',
+                        message: `คุณได้ยกเลิกการจองหนังสือ "${bookTitle}" เรียบร้อยแล้ว`,
+                        sent_date: new Date().toISOString()
+                    });
+                    
+                } else {
+                    // Revert UI changes on error
+                    showNotification(`เกิดข้อผิดพลาด: ${data.message || 'ไม่สามารถยกเลิกการจองได้'}`, 'error', 8000);
+                    setTimeout(() => window.location.reload(), 2000);
+                }
+            } catch (error) {
+                hideLoading();
+                console.error('Cancel reservation error:', error);
+                showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่อีกครั้ง', 'error', 8000);
+                // Revert UI changes on error
+                setTimeout(() => window.location.reload(), 2000);
             }
         }
 
-        // ========================
-        // EVENT LISTENERS
-        // ========================
-        document.addEventListener('DOMContentLoaded', function() {
-            // Modal close on outside click
-            document.addEventListener('click', function(e) {
-                if (e.target.classList.contains('modal')) {
-                    closeModal(e.target.id);
-                }
+        // Utility functions
+        function updateTime() {
+            const now = new Date();
+            const timeString = now.toLocaleTimeString('th-TH', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
             });
+            const timeElement = document.getElementById('current-time');
+            if (timeElement) timeElement.textContent = timeString;
+        }
 
-            // Keyboard shortcuts
+        // Event listeners
+        function initializeEventListeners() {
+            // Close modals with escape key
             document.addEventListener('keydown', function(e) {
-                // Escape to close modal
                 if (e.key === 'Escape') {
-                    const reserveModal = document.getElementById('reserveModal');
-                    if (reserveModal?.style.display === 'block') {
-                        closeModal('reserveModal');
-                    }
-                }
-                
-                // Ctrl/Cmd + K to focus search
-                if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-                    e.preventDefault();
-                    const searchInput = document.getElementById('searchInput');
-                    if (searchInput) searchInput.focus();
+                    closeModal('returnModal');
+                    closeModal('cancelReservationModal');
                 }
             });
 
-            // Enhanced image error handling
-            document.querySelectorAll('.book-image img').forEach(img => {
-                img.addEventListener('error', function() {
-                    this.style.display = 'none';
-                    const parent = this.parentElement;
-                    if (parent && !parent.querySelector('.fas.fa-book')) {
-                        const icon = document.createElement('i');
-                        icon.className = 'fas fa-book';
-                        parent.appendChild(icon);
-                    }
-                });
-            });
+            // Close modals when clicking outside
+            window.onclick = function(event) {
+                const returnModal = document.getElementById('returnModal');
+                const cancelModal = document.getElementById('cancelReservationModal');
+                
+                if (event.target === returnModal) closeModal('returnModal');
+                if (event.target === cancelModal) closeModal('cancelReservationModal');
+            };
 
-            // Search form enhancement
-            const searchForm = document.getElementById('searchForm');
-            if (searchForm) {
-                searchForm.addEventListener('submit', function(e) {
-                    const searchInput = document.getElementById('searchInput');
-                    if (searchInput && searchInput.value.trim() === '') {
-                        e.preventDefault();
-                        searchInput.focus();
-                        showNotification('กรุณาใส่คำค้นหา', 'warning');
-                    }
-                });
-            }
-
-            // Add hover effects to book cards
-            document.querySelectorAll('.book-card').forEach(card => {
-                card.addEventListener('mouseenter', function() {
-                    if (!this.classList.contains('processing')) {
-                        this.style.transform = 'translateY(-8px)';
+            // Enhanced button animations
+            document.querySelectorAll('.btn-return, .btn-cancel').forEach(btn => {
+                btn.addEventListener('mouseenter', function() {
+                    if (!this.disabled) {
+                        this.style.transform = 'translateY(-2px) scale(1.05)';
                     }
                 });
                 
-                card.addEventListener('mouseleave', function() {
-                    if (!this.classList.contains('processing')) {
-                        this.style.transform = 'translateY(0)';
+                btn.addEventListener('mouseleave', function() {
+                    if (!this.disabled) {
+                        this.style.transform = 'translateY(0) scale(1)';
                     }
                 });
             });
 
-            console.log('📚 ห้องสมุดดิจิทัล - System Initialized Successfully!');
-        });
+            // Intersection Observer for animations
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        entry.target.style.opacity = '0';
+                        entry.target.style.transform = 'translateY(30px)';
+                        entry.target.style.transition = 'all 0.6s cubic-bezier(0.25, 0.46, 0.45, 0.94)';
+                        
+                        setTimeout(() => {
+                            entry.target.style.opacity = '1';
+                            entry.target.style.transform = 'translateY(0)';
+                        }, 100);
+                        
+                        observer.unobserve(entry.target);
+                    }
+                });
+            }, { threshold: 0.1 });
 
-        // Global error handler
-        window.addEventListener('error', function(e) {
-            console.error('Global error:', e.error);
-            showNotification('เกิดข้อผิดพลาดระบบ กรุณาลองรีเฟรชหน้า', 'error');
-        });
+            document.querySelectorAll('.stat-card, .book-item, .card').forEach(el => {
+                observer.observe(el);
+            });
+        }
+
+        // Auto refresh every 10 minutes (increased from 5 for better performance)
+        setInterval(() => {
+            console.log('Auto-refreshing dashboard...');
+            window.location.reload();
+        }, 600000);
     </script>
 </body>
 </html>
