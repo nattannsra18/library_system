@@ -20,39 +20,134 @@ if (isset($_GET['action']) && isset($_GET['id'])) {
     $id = $_GET['id'];
     
     if ($action == 'approve_return') {
-        $stmt = $db->prepare("UPDATE borrowing SET status = 'returned', return_date = CURDATE() WHERE borrow_id = ?");
-        $stmt->execute([$id]);
-        
-        // อัพเดต available_copies และตั้งสถานะหนังสือให้พร้อมใช้งาน
+        // ดึงข้อมูลการยืมก่อนอนุมัติ
         $stmt = $db->prepare("
-            UPDATE books b 
-            JOIN borrowing br ON b.book_id = br.book_id 
-            SET b.available_copies = b.available_copies + 1 
-            WHERE br.borrow_id = ?
+            SELECT b.*, u.user_id, u.first_name, u.last_name, u.student_id, bo.title, bo.book_id
+            FROM borrowing b 
+            JOIN users u ON b.user_id = u.user_id 
+            JOIN books bo ON b.book_id = bo.book_id 
+            WHERE b.borrow_id = ? AND b.status = 'pending_return'
         ");
         $stmt->execute([$id]);
+        $borrow_info = $stmt->fetch();
         
-        // ตรวจสอบและอัพเดตสถานะหนังสือให้เป็น available หากมีสำเนาว่าง
-        $stmt = $db->prepare("
-            UPDATE books b
-            JOIN borrowing br ON b.book_id = br.book_id 
-            SET b.status = 'available'
-            WHERE br.borrow_id = ? AND b.available_copies > 0
-        ");
-        $stmt->execute([$id]);
+        if ($borrow_info) {
+            // อัพเดตสถานะการยืม
+            $stmt = $db->prepare("UPDATE borrowing SET status = 'returned', return_date = CURDATE() WHERE borrow_id = ?");
+            $stmt->execute([$id]);
+            
+            // อัพเดต available_copies และตั้งสถานะหนังสือให้พร้อมใช้งาน
+            $stmt = $db->prepare("
+                UPDATE books b 
+                JOIN borrowing br ON b.book_id = br.book_id 
+                SET b.available_copies = b.available_copies + 1 
+                WHERE br.borrow_id = ?
+            ");
+            $stmt->execute([$id]);
+            
+            // ตรวจสอบและอัพเดตสถานะหนังสือให้เป็น available หากมีสำเนาว่าง
+            $stmt = $db->prepare("
+                UPDATE books b
+                JOIN borrowing br ON b.book_id = br.book_id 
+                SET b.status = 'available'
+                WHERE br.borrow_id = ? AND b.available_copies > 0
+            ");
+            $stmt->execute([$id]);
+            
+            // เพิ่มการแจ้งเตือนให้ผู้ใช้
+            $stmt = $db->prepare("
+                INSERT INTO notifications (user_id, type, title, message, sent_date) 
+                VALUES (?, 'return_approved', 'การคืนหนังสือได้รับการอนุมัติ', ?, NOW())
+            ");
+            $notification_message = "การคืนหนังสือ \"{$borrow_info['title']}\" ของคุณได้รับการอนุมัติแล้ว ขอบคุณที่ใช้บริการห้องสมุด";
+            $stmt->execute([$borrow_info['user_id'], $notification_message]);
+            
+            // Log activity
+            $stmt = $db->prepare("
+                INSERT INTO activity_logs (admin_id, action, table_name, record_id, old_values, new_values, ip_address, user_agent) 
+                VALUES (?, 'approve_return', 'borrowing', ?, ?, ?, ?, ?)
+            ");
+            $old_values = json_encode(['status' => 'pending_return']);
+            $new_values = json_encode([
+                'status' => 'returned',
+                'return_date' => date('Y-m-d'),
+                'book_title' => $borrow_info['title'],
+                'user_name' => $borrow_info['first_name'] . ' ' . $borrow_info['last_name']
+            ]);
+            $stmt->execute([
+                $admin_id,
+                $id,
+                $old_values,
+                $new_values,
+                $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+                $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
+            ]);
+            
+            $_SESSION['success'] = "อนุมัติการคืนหนังสือเรียบร้อยแล้ว และส่งแจ้งเตือนให้ผู้ใช้แล้ว";
+        } else {
+            $_SESSION['error'] = "ไม่พบข้อมูลการคืนหนังสือที่ต้องการอนุมัติ";
+        }
         
-        $_SESSION['success'] = "อนุมัติการคืนหนังสือเรียบร้อยแล้ว";
     } elseif ($action == 'reject_return') {
-        $stmt = $db->prepare("UPDATE borrowing SET status = 'borrowed' WHERE borrow_id = ?");
+        // ดึงข้อมูลการยืมก่อนปฏิเสธ
+        $stmt = $db->prepare("
+            SELECT b.*, u.user_id, u.first_name, u.last_name, u.student_id, bo.title
+            FROM borrowing b 
+            JOIN users u ON b.user_id = u.user_id 
+            JOIN books bo ON b.book_id = bo.book_id 
+            WHERE b.borrow_id = ? AND b.status = 'pending_return'
+        ");
         $stmt->execute([$id]);
+        $borrow_info = $stmt->fetch();
         
-        $_SESSION['error'] = "ปฏิเสธการคืนหนังสือ";
+        if ($borrow_info) {
+            // เปลี่ยนสถานะกลับเป็น borrowed หรือ overdue ตามวันครบกำหนด
+            $current_status = (strtotime($borrow_info['due_date']) < time()) ? 'overdue' : 'borrowed';
+            $stmt = $db->prepare("UPDATE borrowing SET status = ? WHERE borrow_id = ?");
+            $stmt->execute([$current_status, $id]);
+            
+            // เพิ่มการแจ้งเตือนให้ผู้ใช้
+            $stmt = $db->prepare("
+                INSERT INTO notifications (user_id, type, title, message, sent_date) 
+                VALUES (?, 'return_rejected', 'การคืนหนังสือถูกปฏิเสธ', ?, NOW())
+            ");
+            $notification_message = "การคืนหนังสือ \"{$borrow_info['title']}\" ถูกปฏิเสธ กรุณาติดต่อเจ้าหน้าที่ห้องสมุดเพื่อสอบถามรายละเอียดเพิ่มเติม หรือนำหนังสือมาคืนที่เคาน์เตอร์อีกครั้ง";
+            $stmt->execute([$borrow_info['user_id'], $notification_message]);
+            
+            // Log activity
+            $stmt = $db->prepare("
+                INSERT INTO activity_logs (admin_id, action, table_name, record_id, old_values, new_values, ip_address, user_agent) 
+                VALUES (?, 'reject_return', 'borrowing', ?, ?, ?, ?, ?)
+            ");
+            $old_values = json_encode(['status' => 'pending_return']);
+            $new_values = json_encode([
+                'status' => $current_status,
+                'reject_date' => date('Y-m-d H:i:s'),
+                'book_title' => $borrow_info['title'],
+                'user_name' => $borrow_info['first_name'] . ' ' . $borrow_info['last_name']
+            ]);
+            $stmt->execute([
+                $admin_id,
+                $id,
+                $old_values,
+                $new_values,
+                $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+                $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
+            ]);
+            
+            $_SESSION['error'] = "ปฏิเสธการคืนหนังสือแล้ว และส่งแจ้งเตือนให้ผู้ใช้แล้ว";
+        } else {
+            $_SESSION['error'] = "ไม่พบข้อมูลการคืนหนังสือที่ต้องการปฏิเสธ";
+        }
+        
     } elseif ($action == 'approve_reservation') {
         // ตรวจสอบว่ามีหนังสือว่างหรือไม่
         $stmt = $db->prepare("
-            SELECT b.available_copies, b.book_id, r.user_id
+            SELECT b.available_copies, b.book_id, r.user_id, r.reservation_date,
+                   u.first_name, u.last_name, u.student_id, b.title
             FROM reservations r 
             JOIN books b ON r.book_id = b.book_id 
+            JOIN users u ON r.user_id = u.user_id
             WHERE r.reservation_id = ? AND r.status = 'active'
         ");
         $stmt->execute([$id]);
@@ -66,6 +161,7 @@ if (isset($_GET['action']) && isset($_GET['id'])) {
                 VALUES (?, ?, ?, CURDATE(), ?, 'borrowed')
             ");
             $stmt->execute([$reservation['user_id'], $reservation['book_id'], $admin_id, $due_date]);
+            $new_borrow_id = $db->lastInsertId();
             
             // อัพเดต reservation status
             $stmt = $db->prepare("UPDATE reservations SET status = 'fulfilled' WHERE reservation_id = ?");
@@ -86,15 +182,91 @@ if (isset($_GET['action']) && isset($_GET['id'])) {
             ");
             $stmt->execute([$reservation['book_id']]);
             
-            $_SESSION['success'] = "อนุมัติการจองเรียบร้อยแล้ว สร้างรายการยืมให้ผู้ใช้แล้ว";
+            // เพิ่มการแจ้งเตือนให้ผู้ใช้
+            $stmt = $db->prepare("
+                INSERT INTO notifications (user_id, type, title, message, sent_date) 
+                VALUES (?, 'reservation_approved', 'การจองหนังสือได้รับการอนุมัติ', ?, NOW())
+            ");
+            $notification_message = "การจองหนังสือ \"{$reservation['title']}\" ของคุณได้รับการอนุมัติแล้ว และได้สร้างรายการยืมให้คุณอัตโนมัติ กำหนดคืน: " . date('d/m/Y', strtotime($due_date)) . " กรุณามารับหนังสือที่เคาน์เตอร์ห้องสมุด";
+            $stmt->execute([$reservation['user_id'], $notification_message]);
+            
+            // Log activity
+            $stmt = $db->prepare("
+                INSERT INTO activity_logs (admin_id, action, table_name, record_id, old_values, new_values, ip_address, user_agent) 
+                VALUES (?, 'approve_reservation', 'reservations', ?, ?, ?, ?, ?)
+            ");
+            $old_values = json_encode(['status' => 'active']);
+            $new_values = json_encode([
+                'status' => 'fulfilled',
+                'borrow_id' => $new_borrow_id,
+                'due_date' => $due_date,
+                'book_title' => $reservation['title'],
+                'user_name' => $reservation['first_name'] . ' ' . $reservation['last_name']
+            ]);
+            $stmt->execute([
+                $admin_id,
+                $id,
+                $old_values,
+                $new_values,
+                $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+                $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
+            ]);
+            
+            $_SESSION['success'] = "อนุมัติการจองเรียบร้อยแล้ว สร้างรายการยืมให้ผู้ใช้แล้ว และส่งแจ้งเตือนแล้ว";
         } else {
             $_SESSION['error'] = "ไม่สามารถอนุมัติการจองได้ เนื่องจากหนังสือไม่ว่าง";
         }
-    } elseif ($action == 'reject_reservation') {
-        $stmt = $db->prepare("UPDATE reservations SET status = 'cancelled' WHERE reservation_id = ?");
-        $stmt->execute([$id]);
         
-        $_SESSION['error'] = "ปฏิเสธการจองแล้ว";
+    } elseif ($action == 'reject_reservation') {
+        // ดึงข้อมูลการจองก่อนปฏิเสธ
+        $stmt = $db->prepare("
+            SELECT r.*, u.user_id, u.first_name, u.last_name, u.student_id, b.title
+            FROM reservations r 
+            JOIN users u ON r.user_id = u.user_id 
+            JOIN books b ON r.book_id = b.book_id 
+            WHERE r.reservation_id = ? AND r.status = 'active'
+        ");
+        $stmt->execute([$id]);
+        $reservation_info = $stmt->fetch();
+        
+        if ($reservation_info) {
+            // อัพเดตสถานะการจอง
+            $stmt = $db->prepare("UPDATE reservations SET status = 'cancelled' WHERE reservation_id = ?");
+            $stmt->execute([$id]);
+            
+            // เพิ่มการแจ้งเตือนให้ผู้ใช้
+            $stmt = $db->prepare("
+                INSERT INTO notifications (user_id, type, title, message, sent_date) 
+                VALUES (?, 'reservation_rejected', 'การจองหนังสือถูกปฏิเสธ', ?, NOW())
+            ");
+            $notification_message = "การจองหนังสือ \"{$reservation_info['title']}\" ถูกปฏิเสธ อาจเนื่องจากหนังสือไม่ว่างหรือเหตุผลอื่น กรุณาติดต่อเจ้าหน้าที่ห้องสมุดเพื่อสอบถามรายละเอียดเพิ่มเติม";
+            $stmt->execute([$reservation_info['user_id'], $notification_message]);
+            
+            // Log activity
+            $stmt = $db->prepare("
+                INSERT INTO activity_logs (admin_id, action, table_name, record_id, old_values, new_values, ip_address, user_agent) 
+                VALUES (?, 'reject_reservation', 'reservations', ?, ?, ?, ?, ?)
+            ");
+            $old_values = json_encode(['status' => 'active']);
+            $new_values = json_encode([
+                'status' => 'cancelled',
+                'reject_date' => date('Y-m-d H:i:s'),
+                'book_title' => $reservation_info['title'],
+                'user_name' => $reservation_info['first_name'] . ' ' . $reservation_info['last_name']
+            ]);
+            $stmt->execute([
+                $admin_id,
+                $id,
+                $old_values,
+                $new_values,
+                $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+                $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
+            ]);
+            
+            $_SESSION['error'] = "ปฏิเสธการจองแล้ว และส่งแจ้งเตือนให้ผู้ใช้แล้ว";
+        } else {
+            $_SESSION['error'] = "ไม่พบข้อมูลการจองที่ต้องการปฏิเสธ";
+        }
     }
     
     header("Location: dashboard.php");
@@ -949,8 +1121,6 @@ $last_activity = $db->query("SELECT created_at FROM activity_logs ORDER BY creat
                 <li><a href="dashboard.php" class="active">แดชบอร์ด</a></li>
                 <li><a href="books.php">จัดการหนังสือ</a></li>
                 <li><a href="users.php">จัดการผู้ใช้</a></li>
-                <li><a href="borrows.php">จัดการการยืม</a></li>
-                <li><a href="reservations.php">การจอง</a></li>
             </ul>
             <a href="../logout.php" class="btn-logout">
                 <i class="fas fa-sign-out-alt"></i>

@@ -1130,7 +1130,6 @@ if (isset($_GET['get_book']) && $_GET['get_book']) {
                 <li><a href="dashboard.php">แดชบอร์ด</a></li>
                 <li><a href="books.php" class="active">จัดการหนังสือ</a></li>
                 <li><a href="users.php">จัดการผู้ใช้</a></li>
-                <li><a href="borrows.php">จัดการการยืม</a></li>
             </ul>
             <a href="../logout.php" class="btn-logout">
                 <i class="fas fa-sign-out-alt"></i>

@@ -173,6 +173,71 @@ $stats = $stmt->fetch(PDO::FETCH_ASSOC);
             padding: 0 20px;
         }
 
+        /* Quick Actions */
+        .quick-actions {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .quick-action {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 15px;
+            text-align: center;
+            text-decoration: none;
+            color: #333;
+            transition: all 0.3s ease;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .quick-action::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+            transition: left 0.3s ease;
+            z-index: 0;
+        }
+
+        .quick-action:hover::before {
+            left: 0;
+        }
+
+        .quick-action:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 30px rgba(0,0,0,0.15);
+        }
+
+        .quick-action i,
+        .quick-action h4,
+        .quick-action p {
+            position: relative;
+            z-index: 1;
+        }
+
+        .quick-action i {
+            font-size: 2.5rem;
+            color: #667eea;
+            margin-bottom: 1rem;
+        }
+
+        .quick-action h4 {
+            font-size: 1.2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .quick-action p {
+            color: #666;
+            font-size: 0.9rem;
+        }
+
         /* Welcome Section */
         .welcome-section {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -543,31 +608,7 @@ $stats = $stmt->fetch(PDO::FETCH_ASSOC);
             backdrop-filter: blur(10px);
         }
 
-        .due-soon { 
-            background: linear-gradient(135deg, #fff3cd, #ffeaa7); 
-            color: #856404; 
-            border: 1px solid #ffeaa7;
-        }
-        .overdue { 
-            background: linear-gradient(135deg, #f8d7da, #ffbaba); 
-            color: #721c24; 
-            border: 1px solid #ffbaba;
-        }
-        .normal { 
-            background: linear-gradient(135deg, #d1ecf1, #a8e6cf); 
-            color: #0c5460; 
-            border: 1px solid #a8e6cf;
-        }
-        .pending-return { 
-            background: linear-gradient(135deg, #e2e3e5, #d6d8db); 
-            color: #383d41; 
-            border: 1px solid #d6d8db;
-        }
-        .reserved-status { 
-            background: linear-gradient(135deg, #e1bee7, #ce93d8); 
-            color: #4a148c; 
-            border: 1px solid #ce93d8;
-        }
+
 
         /* Enhanced Buttons */
         .btn-return, .btn-cancel {
@@ -591,11 +632,6 @@ $stats = $stmt->fetch(PDO::FETCH_ASSOC);
             box-shadow: 0 4px 15px rgba(220, 53, 69, 0.3);
         }
         
-        .btn-pending { 
-            background: linear-gradient(135deg, #6c757d, #868e96); 
-            cursor: not-allowed; 
-            box-shadow: 0 4px 15px rgba(108, 117, 125, 0.3);
-        }
 
         .btn-return:hover:not(:disabled) { 
             background: linear-gradient(135deg, #218838, #1e7e34); 
@@ -1212,11 +1248,25 @@ $stats = $stmt->fetch(PDO::FETCH_ASSOC);
                 <?php endif; ?>
             </div>
             <div class="welcome-text">
-                <h1>ยินดีต้อนรับ, <?php echo htmlspecialchars($user['first_name'] . ' ' . $user['last_name']); ?></h1>
+                <h1>ยินดีต้อนรับ <?php echo htmlspecialchars($user['first_name'] . ' ' . $user['last_name']); ?></h1>
                 <p>รหัสนักเรียน: <?php echo htmlspecialchars($user['student_id']); ?> | แผนก: <?php echo htmlspecialchars($user['department'] ?: 'ไม่ระบุ'); ?></p>
                 <p>เวลา: <span id="current-time"></span> | สมาชิกตั้งแต่: <?php echo date('d/m/Y', strtotime($user['created_at'])); ?></p>
             </div>
         </section>
+
+        <!-- Quick Actions -->
+        <div class="quick-actions">
+            <a href="dashboard.php" class="quick-action">
+                <i class="fas fa-tachometer-alt"></i>
+                <h4>แดชบอร์ด</h4>
+                <p>ดูสถานะการยืมและข้อมูลส่วนตัว</p>
+            </a>
+            <a href="profile.php" class="quick-action">
+                <i class="fas fa-user-cog"></i>
+                <h4>แก้ไขโปรไฟล์</h4>
+                <p>จัดการข้อมูลส่วนตัว เปลี่ยนรหัสผ่าน และการตั้งค่าต่างๆ</p>
+            </a>
+        </div>
 
         <!-- Quick Stats -->
         <div class="quick-stats">
@@ -1345,9 +1395,6 @@ $stats = $stmt->fetch(PDO::FETCH_ASSOC);
                                     <span class="due-date pending-return">
                                         <i class="fas fa-clock"></i> รอแอดมินยืนยัน
                                     </span>
-                                    <button class="btn-pending" disabled>
-                                        <i class="fas fa-hourglass-half"></i> รอยืนยัน
-                                    </button>
                                 </div>
                             </div>
                         <?php endforeach; ?>
@@ -1853,13 +1900,6 @@ $stats = $stmt->fetch(PDO::FETCH_ASSOC);
             showLoading('กำลังแจ้งคืนหนังสือ...');
             closeModal('returnModal');
             
-            // Immediately update UI
-            const itemRemoved = removeBookItem(borrowIdToSend, null, 'borrow');
-            if (itemRemoved) {
-                updateCounts('borrowed', -1);
-                updateCounts('pending', 1);
-            }
-            
             try {
                 const response = await fetch('request_return.php', {
                     method: 'POST',
@@ -1883,29 +1923,76 @@ $stats = $stmt->fetch(PDO::FETCH_ASSOC);
                 hideLoading();
                 
                 if (data.success) {
-                    showNotification(`แจ้งคืนหนังสือ "${bookTitle}" สำเร็จ! รอแอดมินยืนยัน`, 'success', 8000);
+                    // เก็บข้อความแจ้งเตือนใน sessionStorage ก่อนรีเฟรซ
+                    sessionStorage.setItem('notification', JSON.stringify({
+                        message: `แจ้งคืนหนังสือ "${bookTitle}" สำเร็จ! รอแอดมินยืนยัน`,
+                        type: 'success',
+                        duration: 8000
+                    }));
                     
-                    // Add notification to panel
-                    addNotificationToPanel({
-                        type: 'return_pending',
-                        title: 'แจ้งคืนหนังสือ',
-                        message: `คุณได้แจ้งคืนหนังสือ "${bookTitle}" แล้ว รอแอดมินยืนยัน`,
-                        sent_date: new Date().toISOString()
-                    });
+                    // รีเฟรซทันที
+                    window.location.reload();
                     
                 } else {
-                    // Revert UI changes on error
-                    showNotification(`เกิดข้อผิดพลาด: ${data.message || 'ไม่สามารถแจ้งคืนได้'}`, 'error', 8000);
-                    setTimeout(() => window.location.reload(), 2000);
+                    // เก็บข้อความแสดงข้อผิดพลาด
+                    sessionStorage.setItem('notification', JSON.stringify({
+                        message: `เกิดข้อผิดพลาด: ${data.message || 'ไม่สามารถแจ้งคืนได้'}`,
+                        type: 'error',
+                        duration: 8000
+                    }));
+                    
+                    window.location.reload();
                 }
             } catch (error) {
                 hideLoading();
                 console.error('Return error:', error);
-                showNotification('เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่อีกครั้ง', 'error', 8000);
-                // Revert UI changes on error
-                setTimeout(() => window.location.reload(), 2000);
+                
+                // เก็บข้อความแสดงข้อผิดพลาดการเชื่อมต่อ
+                sessionStorage.setItem('notification', JSON.stringify({
+                    message: 'เกิดข้อผิดพลาดในการเชื่อมต่อ กรุณาลองใหม่อีกครั้ง',
+                    type: 'error',
+                    duration: 8000
+                }));
+                
+                window.location.reload();
             }
         }
+
+        // เพิ่มฟังก์ชันนี้ในส่วน DOMContentLoaded
+        document.addEventListener('DOMContentLoaded', function() {
+            updateTime();
+            setInterval(updateTime, 1000);
+            initializeEventListeners();
+            
+            // ตรวจสอบการแจ้งเตือนหลังรีเฟรซ
+            checkPendingNotification();
+            
+            console.log('%cห้องสมุดดิจิทัล - Enhanced Dashboard Loaded', 'color: #667eea; font-size: 16px; font-weight: bold;');
+        });
+
+        // ฟังก์ชันตรวจสอบและแสดงการแจ้งเตือนหลังรีเฟรซ
+        function checkPendingNotification() {
+            const pendingNotification = sessionStorage.getItem('notification');
+            if (pendingNotification) {
+                try {
+                    const notification = JSON.parse(pendingNotification);
+                    
+                    // แสดงการแจ้งเตือนหลังหน้าเว็บโหลดเสร็จ
+                    setTimeout(() => {
+                        showNotification(notification.message, notification.type, notification.duration);
+                    }, 500); // รอให้หน้าเว็บโหลดเสร็จก่อน
+                    
+                    // ลบการแจ้งเตือนออกจาก sessionStorage
+                    sessionStorage.removeItem('notification');
+                    
+                } catch (error) {
+                    console.error('Error parsing notification:', error);
+                    sessionStorage.removeItem('notification');
+                }
+            }
+        }
+
+
 
         // Enhanced confirm cancel reservation with immediate UI updates
         async function confirmCancelReservation() {

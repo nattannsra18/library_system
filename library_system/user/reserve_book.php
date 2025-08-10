@@ -2,6 +2,9 @@
 session_start();
 header('Content-Type: application/json');
 
+// *** ตั้งค่า timezone เป็นประเทศไทย ***
+date_default_timezone_set('Asia/Bangkok');
+
 // Database connection
 $host = 'localhost';
 $dbname = 'library_system';
@@ -11,6 +14,9 @@ $password = '';
 try {
     $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8mb4", $username, $password);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    
+    // *** ตั้งค่า timezone ใน MySQL เป็นเวลาไทย ***
+    $pdo->exec("SET time_zone = '+07:00'");
 } catch(PDOException $e) {
     echo json_encode(['success' => false, 'message' => 'Database connection failed']);
     exit();
@@ -136,7 +142,7 @@ try {
         throw new Exception('หนังสือเล่มนี้ถูกจองแล้ว');
     }
 
-    // Calculate expiry date (1 day from now)
+    // Calculate expiry date (1 day from now) - ใช้เวลาไทยแล้ว
     $reservation_date = date('Y-m-d H:i:s');
     $expiry_date = date('Y-m-d H:i:s', strtotime('+1 day'));
 
@@ -148,6 +154,10 @@ try {
     $stmt->execute([$user_id, $book_id, $reservation_date, $expiry_date]);
     $reservation_id = $pdo->lastInsertId();
 
+    // อัพเดตสถานะหนังสือเป็น reserved
+    $stmt = $pdo->prepare("UPDATE books SET status = 'reserved' WHERE book_id = ?");
+    $stmt->execute([$book_id]);
+
     // Log activity
     $stmt = $pdo->prepare("
         INSERT INTO activity_logs (user_id, action, table_name, record_id, new_values, ip_address, user_agent) 
@@ -158,7 +168,8 @@ try {
         'book_id' => $book_id,
         'book_title' => $book['title'],
         'reservation_date' => $reservation_date,
-        'expiry_date' => $expiry_date
+        'expiry_date' => $expiry_date,
+        'book_status_changed' => 'available -> reserved'
     ]);
     
     $stmt->execute([
@@ -169,7 +180,7 @@ try {
         $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
     ]);
 
-    // Create notification for user
+    // Create notification for user - ใช้เวลาไทยแล้ว
     $stmt = $pdo->prepare("
         INSERT INTO notifications (user_id, type, title, message, sent_date) 
         VALUES (?, 'reservation_pending', 'การจองรอดำเนินการ', ?, ?)
@@ -177,6 +188,17 @@ try {
     
     $notification_message = "คุณได้จองหนังสือ \"{$book['title']}\" เรียบร้อยแล้ว รอแอดมินอนุมัติ กำหนดหมดอายุ: " . date('d/m/Y H:i', strtotime($expiry_date));
     $stmt->execute([$user_id, $notification_message, $reservation_date]);
+
+    // ส่งข้อมูลหนังสือที่อัพเดตแล้วกลับไป
+    $stmt = $pdo->prepare("
+        SELECT b.*, 
+               (SELECT COUNT(*) FROM reservations r WHERE r.book_id = b.book_id AND r.status = 'active') as reserved_count,
+               (SELECT COUNT(*) FROM reservations r WHERE r.book_id = b.book_id AND r.user_id = ? AND r.status = 'active') as user_reserved
+        FROM books b 
+        WHERE b.book_id = ?
+    ");
+    $stmt->execute([$user_id, $book_id]);
+    $updated_book = $stmt->fetch(PDO::FETCH_ASSOC);
 
     $pdo->commit();
 
@@ -187,7 +209,13 @@ try {
             'reservation_id' => $reservation_id,
             'reservation_date' => $reservation_date,
             'expiry_date' => $expiry_date,
-            'book_title' => $book['title']
+            'book_title' => $book['title'],
+            // ข้อมูลหนังสือที่อัพเดตแล้วสำหรับอัพเดต UI
+            'available_copies' => $updated_book['available_copies'],
+            'total_copies' => $updated_book['total_copies'],
+            'status' => $updated_book['status'],
+            'reserved_count' => $updated_book['reserved_count'],
+            'user_reserved' => $updated_book['user_reserved'] > 0
         ]
     ]);
 
